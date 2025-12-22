@@ -2832,9 +2832,11 @@ async def extract_entities(
         cache_keys_collector = []
 
         # Get initial extraction
+        # Format system prompt without input_text for each chunk (enables OpenAI prompt caching across chunks)
         entity_extraction_system_prompt = PROMPTS[
             "entity_extraction_system_prompt"
-        ].format(**{**context_base, "input_text": content})
+        ].format(**context_base)
+        # Format user prompts with input_text for each chunk
         entity_extraction_user_prompt = PROMPTS["entity_extraction_user_prompt"].format(
             **{**context_base, "input_text": content}
         )
@@ -3264,10 +3266,16 @@ async def extract_keywords_only(
     It ONLY extracts keywords (hl_keywords, ll_keywords).
     """
 
-    # 1. Handle cache if needed - add cache type for keywords
+    # 1. Build the examples
+    examples = "\n".join(PROMPTS["keywords_extraction_examples"])
+
+    language = global_config["addon_params"].get("language", DEFAULT_SUMMARY_LANGUAGE)
+
+    # 2. Handle cache if needed - add cache type for keywords
     args_hash = compute_args_hash(
         param.mode,
         text,
+        language,
     )
     cached_result = await handle_cache(
         hashing_kv, args_hash, text, param.mode, cache_type="keywords"
@@ -3283,11 +3291,6 @@ async def extract_keywords_only(
             logger.warning(
                 "Invalid cache format for keywords, proceeding with extraction"
             )
-
-    # 2. Build the examples
-    examples = "\n".join(PROMPTS["keywords_extraction_examples"])
-
-    language = global_config["addon_params"].get("language", DEFAULT_SUMMARY_LANGUAGE)
 
     # 3. Build the keyword-extraction prompt
     kw_prompt = PROMPTS["keywords_extraction"].format(
