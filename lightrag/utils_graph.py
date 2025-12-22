@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import time
 import asyncio
 from typing import Any, cast
@@ -9,6 +10,74 @@ from .kg.shared_storage import get_storage_keyed_lock
 from .constants import GRAPH_FIELD_SEP
 from .utils import compute_mdhash_id, logger
 from .base import StorageNameSpace
+
+
+def _parse_json_list(value: Any) -> list[dict[str, Any]] | None:
+    """Parse a JSON list stored as a string (or already as a list) into a list of dicts."""
+    if value is None:
+        return None
+
+    if isinstance(value, list):
+        items = [item for item in value if isinstance(item, dict)]
+        return items or None
+
+    if isinstance(value, str):
+        if not value.strip():
+            return None
+        try:
+            parsed = json.loads(value)
+        except Exception:
+            return None
+        if isinstance(parsed, list):
+            items = [item for item in parsed if isinstance(item, dict)]
+            return items or None
+
+    return None
+
+
+def _split_graph_field(value: Any) -> list[str]:
+    """Split a string field by GRAPH_FIELD_SEP and drop empty fragments."""
+    if not value or not isinstance(value, str):
+        return []
+    return [frag for frag in value.split(GRAPH_FIELD_SEP) if frag]
+
+
+def _build_description_provenance(
+    *,
+    node_data: dict[str, Any],
+    origin_entity: str,
+    provenance_field: str = "description_provenance",
+) -> list[dict[str, Any]]:
+    """Build per-fragment provenance records for a node.
+
+    The function prefers using an existing JSON provenance field if available.
+    Otherwise, it best-effort pairs description fragments with source_id/file_path
+    fragments by index.
+    """
+    existing = _parse_json_list(node_data.get(provenance_field))
+    if existing is not None:
+        normalized: list[dict[str, Any]] = []
+        for item in existing:
+            record = dict(item)
+            record.setdefault("origin_entity", origin_entity)
+            normalized.append(record)
+        return normalized
+
+    descriptions = _split_graph_field(node_data.get("description", ""))
+    source_ids = _split_graph_field(node_data.get("source_id", ""))
+    file_paths = _split_graph_field(node_data.get("file_path", ""))
+
+    provenance: list[dict[str, Any]] = []
+    for index, fragment in enumerate(descriptions):
+        provenance.append(
+            {
+                "description": fragment,
+                "source_id": source_ids[index] if index < len(source_ids) else None,
+                "file_path": file_paths[index] if index < len(file_paths) else None,
+                "origin_entity": origin_entity,
+            }
+        )
+    return provenance
 
 
 async def _persist_graph_updates(
@@ -1229,6 +1298,25 @@ async def _merge_entities_impl(
             target_entity
         )
 
+    # 2.1 Build per-fragment provenance for merged descriptions (best-effort)
+    merged_description_provenance: list[dict[str, Any]] = []
+    for entity_name in source_entities:
+        node_data = source_entities_data.get(entity_name) or {}
+        if isinstance(node_data, dict):
+            merged_description_provenance.extend(
+                _build_description_provenance(
+                    node_data=node_data,
+                    origin_entity=entity_name,
+                )
+            )
+    if target_exists and isinstance(existing_target_entity_data, dict):
+        merged_description_provenance.extend(
+            _build_description_provenance(
+                node_data=existing_target_entity_data,
+                origin_entity=target_entity,
+            )
+        )
+
     # 3. Merge entity data
     merged_entity_data = _merge_attributes(
         list(source_entities_data.values())
@@ -1240,6 +1328,11 @@ async def _merge_entities_impl(
     # Apply any explicitly provided target entity data (overrides merged data)
     for key, value in target_entity_data.items():
         merged_entity_data[key] = value
+
+    # Store provenance as JSON string for broad backend compatibility
+    merged_entity_data["description_provenance"] = json.dumps(
+        merged_description_provenance, ensure_ascii=False
+    )
 
     # 4. Get all relationships of the source entities and target entity (if exists)
     all_relations = []

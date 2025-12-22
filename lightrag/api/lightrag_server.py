@@ -343,8 +343,12 @@ def create_app(args):
     # Check if API key is provided either through env var or args
     api_key = os.getenv("LIGHTRAG_API_KEY") or args.key
 
+    api_mode = args.api_mode
+
     # Initialize document manager with workspace support for data isolation
-    doc_manager = DocumentManager(args.input_dir, workspace=args.workspace)
+    doc_manager = None
+    if api_mode in ("full", "index"):
+        doc_manager = DocumentManager(args.input_dir, workspace=args.workspace)
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -1082,19 +1086,21 @@ def create_app(args):
         raise
 
     # Add routes
-    app.include_router(
-        create_document_routes(
-            rag,
-            doc_manager,
-            api_key,
+    if api_mode in ("full", "index"):
+        app.include_router(
+            create_document_routes(
+                rag,
+                doc_manager,
+                api_key,
+            )
         )
-    )
-    app.include_router(create_query_routes(rag, api_key, args.top_k))
-    app.include_router(create_graph_routes(rag, api_key))
-
-    # Add Ollama API routes
-    ollama_api = OllamaAPI(rag, top_k=args.top_k, api_key=api_key)
-    app.include_router(ollama_api.router, prefix="/api")
+    if api_mode in ("full", "query"):
+        app.include_router(create_query_routes(rag, api_key, args.top_k))
+        # Add Ollama API routes
+        ollama_api = OllamaAPI(rag, top_k=args.top_k, api_key=api_key)
+        app.include_router(ollama_api.router, prefix="/api")
+    if api_mode == "full":
+        app.include_router(create_graph_routes(rag, api_key))
 
     # Custom Swagger UI endpoint for offline support
     @app.get("/docs", include_in_schema=False)

@@ -218,6 +218,13 @@ def parse_args() -> argparse.Namespace:
         default=get_env_value("WORKERS", DEFAULT_WOKERS, int),
         help="Number of worker processes (default: from env or 1)",
     )
+    parser.add_argument(
+        "--api-mode",
+        type=str.lower,
+        default=get_env_value("LIGHTRAG_API_MODE", "full").lower(),
+        choices=["full", "query", "index"],
+        help="API mode: full (default), query, or index",
+    )
 
     # LLM and embedding bindings
     parser.add_argument(

@@ -1,6 +1,6 @@
 services:
-  lightrag:
-    container_name: lightrag
+  lightrag-query:
+    container_name: lightrag-query
     image: ghcr.io/hkuds/lightrag:latest
     # Use Gunicorn + Uvicorn worker mode so `WORKERS` from `.env` takes effect.
     # (Uvicorn single-process mode forces workers=1 by design.)
@@ -15,7 +15,7 @@ services:
       tags:
         - ghcr.io/hkuds/lightrag:latest
     ports:
-      - "5181:9621"
+      - "5180:9621"
     volumes:
       - ./data/rag_storage:/app/data/rag_storage
       - ./data/inputs:/app/data/inputs
@@ -24,7 +24,7 @@ services:
     env_file:
       - .env
     environment:
-      - LIGHTRAG_API_MODE=index
+      - LIGHTRAG_API_MODE=query
     restart: unless-stopped
     extra_hosts:
       - "host.docker.internal:host-gateway"
