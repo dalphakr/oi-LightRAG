@@ -3867,6 +3867,54 @@ class PGGraphStorage(BaseGraphStorage):
             # When the workspace is "default", use the namespace directly (for backward compatibility with legacy implementations)
             return re.sub(r"[^a-zA-Z0-9_]", "_", namespace)
 
+    async def _age_label_exists(self, label_name: str) -> bool:
+        if self.db is None:
+            return False
+        graph_sql = """
+            SELECT graphid
+            FROM ag_catalog.ag_graph
+            WHERE name = $1
+            LIMIT 1
+        """
+        graph_row = await self.db.query(
+            graph_sql,
+            [self.graph_name],
+            with_age=True,
+            graph_name=self.graph_name,
+        )
+        if not graph_row or "graphid" not in graph_row:
+            return False
+        label_sql = """
+            SELECT 1
+            FROM ag_catalog.ag_label
+            WHERE graph = $1 AND name = $2
+            LIMIT 1
+        """
+        result = await self.db.query(
+            label_sql,
+            [graph_row["graphid"], label_name],
+            with_age=True,
+            graph_name=self.graph_name,
+        )
+        return bool(result)
+
+    async def _age_index_exists(self, index_name: str) -> bool:
+        if self.db is None:
+            return False
+        sql = """
+            SELECT 1
+            FROM pg_indexes
+            WHERE schemaname = $1 AND indexname = $2
+            LIMIT 1
+        """
+        result = await self.db.query(
+            sql,
+            [self.graph_name, index_name],
+            with_age=True,
+            graph_name=self.graph_name,
+        )
+        return bool(result)
+
     @staticmethod
     def _normalize_node_id(node_id: str) -> str:
         """
@@ -3913,33 +3961,95 @@ class PGGraphStorage(BaseGraphStorage):
                 # First ensure AGE extension is created
                 await PostgreSQLDB.configure_age_extension(connection)
 
-            # Execute each statement separately and ignore errors
-            queries = [
-                f"SELECT create_vlabel('{self.graph_name}', 'base');",
-                f"SELECT create_elabel('{self.graph_name}', 'DIRECTED');",
-                # f'CREATE INDEX CONCURRENTLY vertex_p_idx ON {self.graph_name}."_ag_label_vertex" (id)',
-                f'CREATE INDEX CONCURRENTLY vertex_idx_node_id ON {self.graph_name}."_ag_label_vertex" (ag_catalog.agtype_access_operator(properties, \'"entity_id"\'::agtype))',
-                # f'CREATE INDEX CONCURRENTLY edge_p_idx ON {self.graph_name}."_ag_label_edge" (id)',
-                f'CREATE INDEX CONCURRENTLY edge_sid_idx ON {self.graph_name}."_ag_label_edge" (start_id)',
-                f'CREATE INDEX CONCURRENTLY edge_eid_idx ON {self.graph_name}."_ag_label_edge" (end_id)',
-                f'CREATE INDEX CONCURRENTLY edge_seid_idx ON {self.graph_name}."_ag_label_edge" (start_id,end_id)',
-                f'CREATE INDEX CONCURRENTLY directed_p_idx ON {self.graph_name}."DIRECTED" (id)',
-                f'CREATE INDEX CONCURRENTLY directed_eid_idx ON {self.graph_name}."DIRECTED" (end_id)',
-                f'CREATE INDEX CONCURRENTLY directed_sid_idx ON {self.graph_name}."DIRECTED" (start_id)',
-                f'CREATE INDEX CONCURRENTLY directed_seid_idx ON {self.graph_name}."DIRECTED" (start_id,end_id)',
-                f'CREATE INDEX CONCURRENTLY entity_p_idx ON {self.graph_name}."base" (id)',
-                f'CREATE INDEX CONCURRENTLY entity_idx_node_id ON {self.graph_name}."base" (ag_catalog.agtype_access_operator(properties, \'"entity_id"\'::agtype))',
-                f'CREATE INDEX CONCURRENTLY entity_node_id_gin_idx ON {self.graph_name}."base" using gin(properties)',
-                f'ALTER TABLE {self.graph_name}."DIRECTED" CLUSTER ON directed_sid_idx',
+            label_defs = [
+                ("base", f"SELECT create_vlabel('{self.graph_name}', 'base');"),
+                ("DIRECTED", f"SELECT create_elabel('{self.graph_name}', 'DIRECTED');"),
+            ]
+            for label_name, label_sql in label_defs:
+                if not await self._age_label_exists(label_name):
+                    await self.db.execute(
+                        label_sql,
+                        upsert=True,
+                        ignore_if_exists=True,
+                        with_age=True,
+                        graph_name=self.graph_name,
+                    )
+
+            index_defs = [
+                (
+                    "vertex_idx_node_id",
+                    f'CREATE INDEX CONCURRENTLY IF NOT EXISTS vertex_idx_node_id '
+                    f'ON {self.graph_name}."_ag_label_vertex" '
+                    f"(ag_catalog.agtype_access_operator(properties, '\"entity_id\"'::agtype))",
+                ),
+                (
+                    "edge_sid_idx",
+                    f'CREATE INDEX CONCURRENTLY IF NOT EXISTS edge_sid_idx '
+                    f'ON {self.graph_name}."_ag_label_edge" (start_id)',
+                ),
+                (
+                    "edge_eid_idx",
+                    f'CREATE INDEX CONCURRENTLY IF NOT EXISTS edge_eid_idx '
+                    f'ON {self.graph_name}."_ag_label_edge" (end_id)',
+                ),
+                (
+                    "edge_seid_idx",
+                    f'CREATE INDEX CONCURRENTLY IF NOT EXISTS edge_seid_idx '
+                    f'ON {self.graph_name}."_ag_label_edge" (start_id,end_id)',
+                ),
+                (
+                    "directed_p_idx",
+                    f'CREATE INDEX CONCURRENTLY IF NOT EXISTS directed_p_idx '
+                    f'ON {self.graph_name}."DIRECTED" (id)',
+                ),
+                (
+                    "directed_eid_idx",
+                    f'CREATE INDEX CONCURRENTLY IF NOT EXISTS directed_eid_idx '
+                    f'ON {self.graph_name}."DIRECTED" (end_id)',
+                ),
+                (
+                    "directed_sid_idx",
+                    f'CREATE INDEX CONCURRENTLY IF NOT EXISTS directed_sid_idx '
+                    f'ON {self.graph_name}."DIRECTED" (start_id)',
+                ),
+                (
+                    "directed_seid_idx",
+                    f'CREATE INDEX CONCURRENTLY IF NOT EXISTS directed_seid_idx '
+                    f'ON {self.graph_name}."DIRECTED" (start_id,end_id)',
+                ),
+                (
+                    "entity_p_idx",
+                    f'CREATE INDEX CONCURRENTLY IF NOT EXISTS entity_p_idx '
+                    f'ON {self.graph_name}."base" (id)',
+                ),
+                (
+                    "entity_idx_node_id",
+                    f'CREATE INDEX CONCURRENTLY IF NOT EXISTS entity_idx_node_id '
+                    f'ON {self.graph_name}."base" '
+                    f"(ag_catalog.agtype_access_operator(properties, '\"entity_id\"'::agtype))",
+                ),
+                (
+                    "entity_node_id_gin_idx",
+                    f'CREATE INDEX CONCURRENTLY IF NOT EXISTS entity_node_id_gin_idx '
+                    f'ON {self.graph_name}."base" using gin(properties)',
+                ),
             ]
 
-            for query in queries:
-                # Use the new flag to silently ignore "already exists" errors
-                # at the source, preventing log spam.
+            for index_name, index_sql in index_defs:
+                if not await self._age_index_exists(index_name):
+                    await self.db.execute(
+                        index_sql,
+                        upsert=True,
+                        ignore_if_exists=True,
+                        with_age=True,
+                        graph_name=self.graph_name,
+                    )
+
+            if await self._age_index_exists("directed_sid_idx"):
                 await self.db.execute(
-                    query,
+                    f'ALTER TABLE {self.graph_name}."DIRECTED" CLUSTER ON directed_sid_idx',
                     upsert=True,
-                    ignore_if_exists=True,  # Pass the new flag
+                    ignore_if_exists=True,
                     with_age=True,
                     graph_name=self.graph_name,
                 )
