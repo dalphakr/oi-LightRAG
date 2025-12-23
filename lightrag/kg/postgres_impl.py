@@ -60,6 +60,9 @@ T = TypeVar("T")
 # PostgreSQL identifier length limit (in bytes)
 PG_MAX_IDENTIFIER_LENGTH = 63
 
+# Cache AGE graphs created or detected in this process to avoid noisy errors.
+AGE_GRAPH_CACHE: set[str] = set()
+
 
 def _safe_index_name(table_name: str, index_suffix: str) -> str:
     """
@@ -471,13 +474,25 @@ class PostgreSQLDB:
             await connection.execute(  # type: ignore
                 'SET search_path = ag_catalog, "$user", public'
             )
-            await connection.execute(  # type: ignore
-                f"select create_graph('{graph_name}')"
+            if graph_name in AGE_GRAPH_CACHE:
+                return
+            exists = await connection.fetchrow(  # type: ignore
+                "SELECT 1 FROM ag_catalog.ag_graph WHERE name = $1", graph_name
             )
+            if exists:
+                AGE_GRAPH_CACHE.add(graph_name)
+                return
+            await connection.execute(  # type: ignore
+                "select create_graph($1)", graph_name
+            )
+            AGE_GRAPH_CACHE.add(graph_name)
         except (
             asyncpg.exceptions.InvalidSchemaNameError,
+            asyncpg.exceptions.DuplicateSchemaError,
+            asyncpg.exceptions.DuplicateObjectError,
             asyncpg.exceptions.UniqueViolationError,
         ):
+            AGE_GRAPH_CACHE.add(graph_name)
             pass
 
     async def configure_vchordrq(self, connection: asyncpg.Connection) -> None:
@@ -3900,7 +3915,6 @@ class PGGraphStorage(BaseGraphStorage):
 
             # Execute each statement separately and ignore errors
             queries = [
-                f"SELECT create_graph('{self.graph_name}')",
                 f"SELECT create_vlabel('{self.graph_name}', 'base');",
                 f"SELECT create_elabel('{self.graph_name}', 'DIRECTED');",
                 # f'CREATE INDEX CONCURRENTLY vertex_p_idx ON {self.graph_name}."_ag_label_vertex" (id)',

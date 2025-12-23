@@ -1600,15 +1600,39 @@ async def _merge_nodes_then_upsert(
     pipeline_status_lock=None,
     llm_response_cache: BaseKVStorage | None = None,
     entity_chunks_storage: BaseKVStorage | None = None,
+    timing_overrides: dict[str, float] | None = None,
 ):
     """Get existing nodes from knowledge graph use name,if exists, merge data, else create, then upsert."""
+    merge_start = time.perf_counter()
+    timings: dict[str, float] = {}
+    if timing_overrides:
+        timings.update(timing_overrides)
+
+    def _timing_info() -> str:
+        timings["total"] = time.perf_counter() - merge_start
+        timing_parts = [
+            ("total", timings.get("total", 0.0)),
+            ("semaphore_wait", timings.get("semaphore_wait", 0.0)),
+            ("lock_wait", timings.get("lock_wait", 0.0)),
+            ("graph_get", timings.get("graph_get", 0.0)),
+            ("chunks_get", timings.get("entity_chunks_get", 0.0)),
+            ("chunks_upsert", timings.get("entity_chunks_upsert", 0.0)),
+            ("summary", timings.get("summary", 0.0)),
+            ("graph_upsert", timings.get("graph_upsert", 0.0)),
+            ("vdb_upsert", timings.get("vdb_upsert", 0.0)),
+        ]
+        return ", ".join(
+            f"{name}={value:.2f}s" for name, value in timing_parts if value > 0
+        )
     already_entity_types = []
     already_source_ids = []
     already_description = []
     already_file_paths = []
 
     # 1. Get existing node data from knowledge graph
+    graph_get_start = time.perf_counter()
     already_node = await knowledge_graph_inst.get_node(entity_name)
+    timings["graph_get"] = time.perf_counter() - graph_get_start
     if already_node:
         already_entity_types.append(already_node["entity_type"])
         already_source_ids.extend(already_node["source_id"].split(GRAPH_FIELD_SEP))
@@ -1619,7 +1643,9 @@ async def _merge_nodes_then_upsert(
 
     existing_full_source_ids = []
     if entity_chunks_storage is not None:
+        chunks_get_start = time.perf_counter()
         stored_chunks = await entity_chunks_storage.get_by_id(entity_name)
+        timings["entity_chunks_get"] = time.perf_counter() - chunks_get_start
         if stored_chunks and isinstance(stored_chunks, dict):
             existing_full_source_ids = [
                 chunk_id for chunk_id in stored_chunks.get("chunk_ids", []) if chunk_id
@@ -1634,6 +1660,7 @@ async def _merge_nodes_then_upsert(
     full_source_ids = merge_source_ids(existing_full_source_ids, new_source_ids)
 
     if entity_chunks_storage is not None and full_source_ids:
+        chunks_upsert_start = time.perf_counter()
         await entity_chunks_storage.upsert(
             {
                 entity_name: {
@@ -1642,6 +1669,7 @@ async def _merge_nodes_then_upsert(
                 }
             }
         )
+        timings["entity_chunks_upsert"] = time.perf_counter() - chunks_upsert_start
 
     # 3. Finalize source_id by applying source ids limit
     limit_method = global_config.get("source_ids_limit_method")
@@ -1678,8 +1706,11 @@ async def _merge_nodes_then_upsert(
         and not nodes_data
     ):
         if already_node:
+            timing_info = _timing_info()
             logger.info(
-                f"Skipped `{entity_name}`: KEEP old chunks {already_source_ids}/{len(full_source_ids)}"
+                f"Skipped `{entity_name}`: KEEP old chunks "
+                f"{already_source_ids}/{len(full_source_ids)} "
+                f"(timing: {timing_info})"
             )
             existing_node_data = dict(already_node)
             return existing_node_data
@@ -1730,6 +1761,7 @@ async def _merge_nodes_then_upsert(
                 raise PipelineCancelledException("User cancelled during entity summary")
 
     # 8. Get summary description an LLM usage status
+    summary_start = time.perf_counter()
     description, llm_was_used = await _handle_entity_relation_summary(
         "Entity",
         entity_name,
@@ -1738,6 +1770,7 @@ async def _merge_nodes_then_upsert(
         global_config,
         llm_response_cache,
     )
+    timings["summary"] = time.perf_counter() - summary_start
 
     # 9. Build file_path within MAX_FILE_PATHS
     file_paths_list = []
@@ -1821,16 +1854,6 @@ async def _merge_nodes_then_upsert(
             f" ({', '.join(filter(None, [truncation_info_log, dd_message]))})"
         )
 
-    # Add message to pipeline satus when merge happens
-    if already_fragment > 0 or llm_was_used:
-        logger.info(status_message)
-        if pipeline_status is not None and pipeline_status_lock is not None:
-            async with pipeline_status_lock:
-                pipeline_status["latest_message"] = status_message
-                pipeline_status["history_messages"].append(status_message)
-    else:
-        logger.debug(status_message)
-
     # 11. Update both graph and vector db
     node_data = dict(
         entity_id=entity_name,
@@ -1841,10 +1864,12 @@ async def _merge_nodes_then_upsert(
         created_at=int(time.time()),
         truncate=truncation_info,
     )
+    graph_upsert_start = time.perf_counter()
     await knowledge_graph_inst.upsert_node(
         entity_name,
         node_data=node_data,
     )
+    timings["graph_upsert"] = time.perf_counter() - graph_upsert_start
     node_data["entity_name"] = entity_name
     if entity_vdb is not None:
         entity_vdb_id = compute_mdhash_id(str(entity_name), prefix="ent-")
@@ -1858,6 +1883,7 @@ async def _merge_nodes_then_upsert(
                 "file_path": file_path,
             }
         }
+        vdb_upsert_start = time.perf_counter()
         await safe_vdb_operation_with_exception(
             operation=lambda payload=data_for_vdb: entity_vdb.upsert(payload),
             operation_name="entity_upsert",
@@ -1865,6 +1891,21 @@ async def _merge_nodes_then_upsert(
             max_retries=3,
             retry_delay=0.1,
         )
+        timings["vdb_upsert"] = time.perf_counter() - vdb_upsert_start
+
+    timing_info = _timing_info()
+    if timing_info:
+        status_message += f" (timing: {timing_info})"
+
+    # Add message to pipeline satus when merge happens
+    if already_fragment > 0 or llm_was_used:
+        logger.info(status_message)
+        if pipeline_status is not None and pipeline_status_lock is not None:
+            async with pipeline_status_lock:
+                pipeline_status["latest_message"] = status_message
+                pipeline_status["history_messages"].append(status_message)
+    else:
+        logger.debug(status_message)
     return node_data
 
 
@@ -1882,7 +1923,40 @@ async def _merge_edges_then_upsert(
     added_entities: list = None,  # New parameter to track entities added during edge processing
     relation_chunks_storage: BaseKVStorage | None = None,
     entity_chunks_storage: BaseKVStorage | None = None,
+    timing_overrides: dict[str, float] | None = None,
 ):
+    merge_start = time.perf_counter()
+    timings: dict[str, float] = {}
+    if timing_overrides:
+        timings.update(timing_overrides)
+
+    def _timing_info() -> str:
+        timings["total"] = time.perf_counter() - merge_start
+        timing_parts = [
+            ("total", timings.get("total", 0.0)),
+            ("semaphore_wait", timings.get("semaphore_wait", 0.0)),
+            ("lock_wait", timings.get("lock_wait", 0.0)),
+            ("edge_has", timings.get("edge_has", 0.0)),
+            ("edge_get", timings.get("edge_get", 0.0)),
+            ("chunks_get", timings.get("relation_chunks_get", 0.0)),
+            ("chunks_upsert", timings.get("relation_chunks_upsert", 0.0)),
+            ("summary", timings.get("summary", 0.0)),
+            ("node_get", timings.get("node_get", 0.0)),
+            ("node_create_graph", timings.get("node_create_graph", 0.0)),
+            ("node_create_chunks", timings.get("node_create_chunks", 0.0)),
+            ("node_create_vdb", timings.get("node_create_vdb", 0.0)),
+            ("node_update_chunks_get", timings.get("node_update_chunks_get", 0.0)),
+            ("node_update_chunks_upsert", timings.get("node_update_chunks_upsert", 0.0)),
+            ("node_update_graph", timings.get("node_update_graph", 0.0)),
+            ("node_update_vdb", timings.get("node_update_vdb", 0.0)),
+            ("edge_graph", timings.get("edge_graph", 0.0)),
+            ("rel_vdb_delete", timings.get("rel_vdb_delete", 0.0)),
+            ("rel_vdb_upsert", timings.get("rel_vdb_upsert", 0.0)),
+        ]
+        return ", ".join(
+            f"{name}={value:.2f}s" for name, value in timing_parts if value > 0
+        )
+
     if src_id == tgt_id:
         return None
 
@@ -1894,8 +1968,13 @@ async def _merge_edges_then_upsert(
     already_file_paths = []
 
     # 1. Get existing edge data from graph storage
-    if await knowledge_graph_inst.has_edge(src_id, tgt_id):
+    edge_has_start = time.perf_counter()
+    has_edge = await knowledge_graph_inst.has_edge(src_id, tgt_id)
+    timings["edge_has"] = time.perf_counter() - edge_has_start
+    if has_edge:
+        edge_get_start = time.perf_counter()
         already_edge = await knowledge_graph_inst.get_edge(src_id, tgt_id)
+        timings["edge_get"] = time.perf_counter() - edge_get_start
         # Handle the case where get_edge returns None or missing fields
         if already_edge:
             # Get weight with default 1.0 if missing
@@ -1932,7 +2011,9 @@ async def _merge_edges_then_upsert(
     storage_key = make_relation_chunk_key(src_id, tgt_id)
     existing_full_source_ids = []
     if relation_chunks_storage is not None:
+        chunks_get_start = time.perf_counter()
         stored_chunks = await relation_chunks_storage.get_by_id(storage_key)
+        timings["relation_chunks_get"] = time.perf_counter() - chunks_get_start
         if stored_chunks and isinstance(stored_chunks, dict):
             existing_full_source_ids = [
                 chunk_id for chunk_id in stored_chunks.get("chunk_ids", []) if chunk_id
@@ -1947,6 +2028,7 @@ async def _merge_edges_then_upsert(
     full_source_ids = merge_source_ids(existing_full_source_ids, new_source_ids)
 
     if relation_chunks_storage is not None and full_source_ids:
+        chunks_upsert_start = time.perf_counter()
         await relation_chunks_storage.upsert(
             {
                 storage_key: {
@@ -1955,6 +2037,7 @@ async def _merge_edges_then_upsert(
                 }
             }
         )
+        timings["relation_chunks_upsert"] = time.perf_counter() - chunks_upsert_start
 
     # 3. Finalize source_id by applying source ids limit
     limit_method = global_config.get("source_ids_limit_method")
@@ -1994,8 +2077,11 @@ async def _merge_edges_then_upsert(
         and not edges_data
     ):
         if already_edge:
+            timing_info = _timing_info()
             logger.info(
-                f"Skipped `{src_id}`~`{tgt_id}`: KEEP old chunks  {already_source_ids}/{len(full_source_ids)}"
+                f"Skipped `{src_id}`~`{tgt_id}`: KEEP old chunks  "
+                f"{already_source_ids}/{len(full_source_ids)} "
+                f"(timing: {timing_info})"
             )
             existing_edge_data = dict(already_edge)
             return existing_edge_data
@@ -2059,6 +2145,7 @@ async def _merge_edges_then_upsert(
                 )
 
     # 8. Get summary description an LLM usage status
+    summary_start = time.perf_counter()
     description, llm_was_used = await _handle_entity_relation_summary(
         "Relation",
         f"({src_id}, {tgt_id})",
@@ -2067,6 +2154,7 @@ async def _merge_edges_then_upsert(
         global_config,
         llm_response_cache,
     )
+    timings["summary"] = time.perf_counter() - summary_start
 
     # 9. Build file_path within MAX_FILE_PATHS limit
     file_paths_list = []
@@ -2154,20 +2242,14 @@ async def _merge_edges_then_upsert(
             f" ({', '.join(filter(None, [truncation_info_log, dd_message]))})"
         )
 
-    # Add message to pipeline satus when merge happens
-    if already_fragment > 0 or llm_was_used:
-        logger.info(status_message)
-        if pipeline_status is not None and pipeline_status_lock is not None:
-            async with pipeline_status_lock:
-                pipeline_status["latest_message"] = status_message
-                pipeline_status["history_messages"].append(status_message)
-    else:
-        logger.debug(status_message)
-
     # 11. Update both graph and vector db
     for need_insert_id in [src_id, tgt_id]:
         # Optimization: Use get_node instead of has_node + get_node
+        node_get_start = time.perf_counter()
         existing_node = await knowledge_graph_inst.get_node(need_insert_id)
+        timings["node_get"] = timings.get("node_get", 0.0) + (
+            time.perf_counter() - node_get_start
+        )
 
         if existing_node is None:
             # Node doesn't exist - create new node
@@ -2181,12 +2263,17 @@ async def _merge_edges_then_upsert(
                 "created_at": node_created_at,
                 "truncate": "",
             }
+            node_graph_start = time.perf_counter()
             await knowledge_graph_inst.upsert_node(need_insert_id, node_data=node_data)
+            timings["node_create_graph"] = timings.get("node_create_graph", 0.0) + (
+                time.perf_counter() - node_graph_start
+            )
 
             # Update entity_chunks_storage for the newly created entity
             if entity_chunks_storage is not None:
                 chunk_ids = [chunk_id for chunk_id in full_source_ids if chunk_id]
                 if chunk_ids:
+                    node_chunks_start = time.perf_counter()
                     await entity_chunks_storage.upsert(
                         {
                             need_insert_id: {
@@ -2195,6 +2282,9 @@ async def _merge_edges_then_upsert(
                             }
                         }
                     )
+                    timings["node_create_chunks"] = timings.get(
+                        "node_create_chunks", 0.0
+                    ) + (time.perf_counter() - node_chunks_start)
 
             if entity_vdb is not None:
                 entity_vdb_id = compute_mdhash_id(need_insert_id, prefix="ent-")
@@ -2208,12 +2298,16 @@ async def _merge_edges_then_upsert(
                         "file_path": file_path,
                     }
                 }
+                node_vdb_start = time.perf_counter()
                 await safe_vdb_operation_with_exception(
                     operation=lambda payload=vdb_data: entity_vdb.upsert(payload),
                     operation_name="added_entity_upsert",
                     entity_name=need_insert_id,
                     max_retries=3,
                     retry_delay=0.1,
+                )
+                timings["node_create_vdb"] = timings.get("node_create_vdb", 0.0) + (
+                    time.perf_counter() - node_vdb_start
                 )
 
             # Track entities added during edge processing
@@ -2234,7 +2328,11 @@ async def _merge_edges_then_upsert(
             # 1. Get existing full source_ids from entity_chunks_storage
             existing_full_source_ids = []
             if entity_chunks_storage is not None:
+                node_chunks_get_start = time.perf_counter()
                 stored_chunks = await entity_chunks_storage.get_by_id(need_insert_id)
+                timings["node_update_chunks_get"] = timings.get(
+                    "node_update_chunks_get", 0.0
+                ) + (time.perf_counter() - node_chunks_get_start)
                 if stored_chunks and isinstance(stored_chunks, dict):
                     existing_full_source_ids = [
                         chunk_id
@@ -2263,6 +2361,7 @@ async def _merge_edges_then_upsert(
                 and merged_full_source_ids != existing_full_source_ids
             ):
                 updated = True
+                node_chunks_upsert_start = time.perf_counter()
                 await entity_chunks_storage.upsert(
                     {
                         need_insert_id: {
@@ -2271,6 +2370,9 @@ async def _merge_edges_then_upsert(
                         }
                     }
                 )
+                timings["node_update_chunks_upsert"] = timings.get(
+                    "node_update_chunks_upsert", 0.0
+                ) + (time.perf_counter() - node_chunks_upsert_start)
 
             # 4. Apply source_ids limit for graph and vector db
             limit_method = global_config.get(
@@ -2293,9 +2395,13 @@ async def _merge_edges_then_upsert(
                     **existing_node,
                     "source_id": limited_source_id_str,
                 }
+                node_graph_update_start = time.perf_counter()
                 await knowledge_graph_inst.upsert_node(
                     need_insert_id, node_data=updated_node_data
                 )
+                timings["node_update_graph"] = timings.get(
+                    "node_update_graph", 0.0
+                ) + (time.perf_counter() - node_graph_update_start)
 
                 # Update vector database
                 if entity_vdb is not None:
@@ -2314,6 +2420,7 @@ async def _merge_edges_then_upsert(
                             ),
                         }
                     }
+                    node_vdb_update_start = time.perf_counter()
                     await safe_vdb_operation_with_exception(
                         operation=lambda payload=vdb_data: entity_vdb.upsert(payload),
                         operation_name="existing_entity_update",
@@ -2321,6 +2428,9 @@ async def _merge_edges_then_upsert(
                         max_retries=3,
                         retry_delay=0.1,
                     )
+                    timings["node_update_vdb"] = timings.get(
+                        "node_update_vdb", 0.0
+                    ) + (time.perf_counter() - node_vdb_update_start)
 
             # 6. Log once at the end if any update occurred
             if updated:
@@ -2332,6 +2442,7 @@ async def _merge_edges_then_upsert(
                         pipeline_status["history_messages"].append(status_message)
 
     edge_created_at = int(time.time())
+    edge_graph_start = time.perf_counter()
     await knowledge_graph_inst.upsert_edge(
         src_id,
         tgt_id,
@@ -2345,6 +2456,7 @@ async def _merge_edges_then_upsert(
             truncate=truncation_info,
         ),
     )
+    timings["edge_graph"] = time.perf_counter() - edge_graph_start
 
     edge_data = dict(
         src_id=src_id,
@@ -2365,11 +2477,16 @@ async def _merge_edges_then_upsert(
     if relationships_vdb is not None:
         rel_vdb_id = compute_mdhash_id(src_id + tgt_id, prefix="rel-")
         rel_vdb_id_reverse = compute_mdhash_id(tgt_id + src_id, prefix="rel-")
+        rel_delete_start = time.perf_counter()
         try:
             await relationships_vdb.delete([rel_vdb_id, rel_vdb_id_reverse])
         except Exception as e:
             logger.debug(
                 f"Could not delete old relationship vector records {rel_vdb_id}, {rel_vdb_id_reverse}: {e}"
+            )
+        finally:
+            timings["rel_vdb_delete"] = timings.get("rel_vdb_delete", 0.0) + (
+                time.perf_counter() - rel_delete_start
             )
         rel_content = f"{keywords}\t{src_id}\n{tgt_id}\n{description}"
         vdb_data = {
@@ -2384,6 +2501,7 @@ async def _merge_edges_then_upsert(
                 "file_path": file_path,
             }
         }
+        rel_upsert_start = time.perf_counter()
         await safe_vdb_operation_with_exception(
             operation=lambda payload=vdb_data: relationships_vdb.upsert(payload),
             operation_name="relationship_upsert",
@@ -2391,6 +2509,23 @@ async def _merge_edges_then_upsert(
             max_retries=3,
             retry_delay=0.2,
         )
+        timings["rel_vdb_upsert"] = timings.get("rel_vdb_upsert", 0.0) + (
+            time.perf_counter() - rel_upsert_start
+        )
+
+    timing_info = _timing_info()
+    if timing_info:
+        status_message += f" (timing: {timing_info})"
+
+    # Add message to pipeline satus when merge happens
+    if already_fragment > 0 or llm_was_used:
+        logger.info(status_message)
+        if pipeline_status is not None and pipeline_status_lock is not None:
+            async with pipeline_status_lock:
+                pipeline_status["latest_message"] = status_message
+                pipeline_status["history_messages"].append(status_message)
+    else:
+        logger.debug(status_message)
 
     return edge_data
 
@@ -2445,10 +2580,12 @@ async def merge_nodes_and_edges(
             if pipeline_status.get("cancellation_requested", False):
                 raise PipelineCancelledException("User cancelled during merge phase")
 
+    merge_start = time.perf_counter()
     # Collect all nodes and edges from all chunks
     all_nodes = defaultdict(list)
     all_edges = defaultdict(list)
 
+    collect_start = time.perf_counter()
     for maybe_nodes, maybe_edges in chunk_results:
         # Collect nodes
         for entity_name, entities in maybe_nodes.items():
@@ -2461,8 +2598,19 @@ async def merge_nodes_and_edges(
 
     total_entities_count = len(all_nodes)
     total_relations_count = len(all_edges)
+    collect_duration = time.perf_counter() - collect_start
 
     log_message = f"Merging stage {current_file_number}/{total_files}: {file_path}"
+    logger.info(log_message)
+    async with pipeline_status_lock:
+        pipeline_status["latest_message"] = log_message
+        pipeline_status["history_messages"].append(log_message)
+
+    log_message = (
+        f"Merging input collected {current_file_number}/{total_files}: "
+        f"{collect_duration:.2f}s (entities={total_entities_count}, "
+        f"relations={total_relations_count})"
+    )
     logger.info(log_message)
     async with pipeline_status_lock:
         pipeline_status["latest_message"] = log_message
@@ -2480,7 +2628,9 @@ async def merge_nodes_and_edges(
         pipeline_status["history_messages"].append(log_message)
 
     async def _locked_process_entity_name(entity_name, entities):
+        semaphore_wait_start = time.perf_counter()
         async with semaphore:
+            semaphore_wait = time.perf_counter() - semaphore_wait_start
             # Check for cancellation before processing entity
             if pipeline_status is not None and pipeline_status_lock is not None:
                 async with pipeline_status_lock:
@@ -2491,9 +2641,11 @@ async def merge_nodes_and_edges(
 
             workspace = global_config.get("workspace", "")
             namespace = f"{workspace}:GraphDB" if workspace else "GraphDB"
+            lock_wait_start = time.perf_counter()
             async with get_storage_keyed_lock(
                 [entity_name], namespace=namespace, enable_logging=False
             ):
+                lock_wait = time.perf_counter() - lock_wait_start
                 try:
                     logger.debug(f"Processing entity {entity_name}")
                     entity_data = await _merge_nodes_then_upsert(
@@ -2506,6 +2658,10 @@ async def merge_nodes_and_edges(
                         pipeline_status_lock,
                         llm_response_cache,
                         entity_chunks_storage,
+                        timing_overrides={
+                            "semaphore_wait": semaphore_wait,
+                            "lock_wait": lock_wait,
+                        },
                     )
 
                     return entity_data
@@ -2541,6 +2697,7 @@ async def merge_nodes_and_edges(
         entity_tasks.append(task)
 
     # Execute entity tasks with error handling
+    phase1_start = time.perf_counter()
     processed_entities = []
     if entity_tasks:
         done, pending = await asyncio.wait(
@@ -2573,6 +2730,16 @@ async def merge_nodes_and_edges(
         if first_exception is not None:
             raise first_exception
 
+    phase1_duration = time.perf_counter() - phase1_start
+    log_message = (
+        f"Phase 1 completed for {doc_id} in {phase1_duration:.2f}s "
+        f"(entities={total_entities_count})"
+    )
+    logger.info(log_message)
+    async with pipeline_status_lock:
+        pipeline_status["latest_message"] = log_message
+        pipeline_status["history_messages"].append(log_message)
+
     # ===== Phase 2: Process all relationships concurrently =====
     log_message = f"Phase 2: Processing {total_relations_count} relations from {doc_id} (async: {graph_max_async})"
     logger.info(log_message)
@@ -2581,7 +2748,9 @@ async def merge_nodes_and_edges(
         pipeline_status["history_messages"].append(log_message)
 
     async def _locked_process_edges(edge_key, edges):
+        semaphore_wait_start = time.perf_counter()
         async with semaphore:
+            semaphore_wait = time.perf_counter() - semaphore_wait_start
             # Check for cancellation before processing edges
             if pipeline_status is not None and pipeline_status_lock is not None:
                 async with pipeline_status_lock:
@@ -2594,11 +2763,13 @@ async def merge_nodes_and_edges(
             namespace = f"{workspace}:GraphDB" if workspace else "GraphDB"
             sorted_edge_key = sorted([edge_key[0], edge_key[1]])
 
+            lock_wait_start = time.perf_counter()
             async with get_storage_keyed_lock(
                 sorted_edge_key,
                 namespace=namespace,
                 enable_logging=False,
             ):
+                lock_wait = time.perf_counter() - lock_wait_start
                 try:
                     added_entities = []  # Track entities added during edge processing
 
@@ -2617,6 +2788,10 @@ async def merge_nodes_and_edges(
                         added_entities,  # Pass list to collect added entities
                         relation_chunks_storage,
                         entity_chunks_storage,  # Add entity_chunks_storage parameter
+                        timing_overrides={
+                            "semaphore_wait": semaphore_wait,
+                            "lock_wait": lock_wait,
+                        },
                     )
 
                     if edge_data is None:
@@ -2655,6 +2830,7 @@ async def merge_nodes_and_edges(
         edge_tasks.append(task)
 
     # Execute relationship tasks with error handling
+    phase2_start = time.perf_counter()
     processed_edges = []
     all_added_entities = []
 
@@ -2693,8 +2869,19 @@ async def merge_nodes_and_edges(
         if first_exception is not None:
             raise first_exception
 
+    phase2_duration = time.perf_counter() - phase2_start
+    log_message = (
+        f"Phase 2 completed for {doc_id} in {phase2_duration:.2f}s "
+        f"(relations={total_relations_count})"
+    )
+    logger.info(log_message)
+    async with pipeline_status_lock:
+        pipeline_status["latest_message"] = log_message
+        pipeline_status["history_messages"].append(log_message)
+
     # ===== Phase 3: Update full_entities and full_relations storage =====
     if full_entities_storage and full_relations_storage and doc_id:
+        phase3_start = time.perf_counter()
         try:
             # Merge all entities: original entities + entities added during edge processing
             final_entity_names = set()
@@ -2748,6 +2935,16 @@ async def merge_nodes_and_edges(
                     }
                 )
 
+            phase3_duration = time.perf_counter() - phase3_start
+            log_message = (
+                f"Phase 3 completed for {doc_id} in {phase3_duration:.2f}s "
+                f"(entities={len(final_entity_names)}, relations={len(final_relation_pairs)})"
+            )
+            logger.info(log_message)
+            async with pipeline_status_lock:
+                pipeline_status["latest_message"] = log_message
+                pipeline_status["history_messages"].append(log_message)
+
             logger.debug(
                 f"Updated entity-relation index for document {doc_id}: {len(final_entity_names)} entities (original: {len(processed_entities)}, added: {len(all_added_entities)}), {len(final_relation_pairs)} relations"
             )
@@ -2758,7 +2955,13 @@ async def merge_nodes_and_edges(
             )
             # Don't raise exception to avoid affecting main flow
 
-    log_message = f"Completed merging: {len(processed_entities)} entities, {len(all_added_entities)} extra entities, {len(processed_edges)} relations"
+    merge_duration = time.perf_counter() - merge_start
+    log_message = (
+        f"Completed merging in {merge_duration:.2f}s: "
+        f"{len(processed_entities)} entities, "
+        f"{len(all_added_entities)} extra entities, "
+        f"{len(processed_edges)} relations"
+    )
     logger.info(log_message)
     async with pipeline_status_lock:
         pipeline_status["latest_message"] = log_message
@@ -2812,8 +3015,20 @@ async def extract_entities(
 
     processed_chunks = 0
     total_chunks = len(ordered_chunks)
+    extract_start = time.perf_counter()
+    chunk_max_async = global_config.get("llm_model_max_async", 4)
+    log_message = (
+        f"Entity extraction started: {total_chunks} chunks (async: {chunk_max_async})"
+    )
+    logger.info(log_message)
+    if pipeline_status is not None and pipeline_status_lock is not None:
+        async with pipeline_status_lock:
+            pipeline_status["latest_message"] = log_message
+            pipeline_status["history_messages"].append(log_message)
 
-    async def _process_single_content(chunk_key_dp: tuple[str, TextChunkSchema]):
+    async def _process_single_content(
+        chunk_key_dp: tuple[str, TextChunkSchema], queue_wait: float = 0.0
+    ):
         """Process a single chunk
         Args:
             chunk_key_dp (tuple[str, TextChunkSchema]):
@@ -2827,6 +3042,7 @@ async def extract_entities(
         content = chunk_dp["content"]
         # Get file path from chunk data or use default
         file_path = chunk_dp.get("file_path", "unknown_source")
+        chunk_start = time.perf_counter()
 
         # Create cache keys collector for batch processing
         cache_keys_collector = []
@@ -2844,6 +3060,7 @@ async def extract_entities(
             "entity_continue_extraction_user_prompt"
         ].format(**{**context_base, "input_text": content})
 
+        llm_start = time.perf_counter()
         final_result, timestamp = await use_llm_func_with_cache(
             entity_extraction_user_prompt,
             use_llm_func,
@@ -2853,11 +3070,13 @@ async def extract_entities(
             chunk_id=chunk_key,
             cache_keys_collector=cache_keys_collector,
         )
+        llm_duration = time.perf_counter() - llm_start
 
         history = pack_user_ass_to_openai_messages(
             entity_extraction_user_prompt, final_result
         )
 
+        parse_start = time.perf_counter()
         # Process initial extraction with file path
         maybe_nodes, maybe_edges = await _process_extraction_result(
             final_result,
@@ -2867,9 +3086,13 @@ async def extract_entities(
             tuple_delimiter=context_base["tuple_delimiter"],
             completion_delimiter=context_base["completion_delimiter"],
         )
+        parse_duration = time.perf_counter() - parse_start
 
+        glean_duration = 0.0
+        glean_parse_duration = 0.0
         # Process additional gleaning results only 1 time when entity_extract_max_gleaning is greater than zero.
         if entity_extract_max_gleaning > 0:
+            glean_start = time.perf_counter()
             glean_result, timestamp = await use_llm_func_with_cache(
                 entity_continue_extraction_user_prompt,
                 use_llm_func,
@@ -2880,7 +3103,9 @@ async def extract_entities(
                 chunk_id=chunk_key,
                 cache_keys_collector=cache_keys_collector,
             )
+            glean_duration = time.perf_counter() - glean_start
 
+            glean_parse_start = time.perf_counter()
             # Process gleaning result separately with file path
             glean_nodes, glean_edges = await _process_extraction_result(
                 glean_result,
@@ -2890,6 +3115,7 @@ async def extract_entities(
                 tuple_delimiter=context_base["tuple_delimiter"],
                 completion_delimiter=context_base["completion_delimiter"],
             )
+            glean_parse_duration = time.perf_counter() - glean_parse_start
 
             # Merge results - compare description lengths to choose better version
             for entity_name, glean_entities in glean_nodes.items():
@@ -2922,19 +3148,38 @@ async def extract_entities(
                     # New edge from gleaning stage
                     maybe_edges[edge_key] = list(glean_edges)
 
+        cache_update_duration = 0.0
         # Batch update chunk's llm_cache_list with all collected cache keys
         if cache_keys_collector and text_chunks_storage:
+            cache_update_start = time.perf_counter()
             await update_chunk_cache_list(
                 chunk_key,
                 text_chunks_storage,
                 cache_keys_collector,
                 "entity_extraction",
             )
+            cache_update_duration = time.perf_counter() - cache_update_start
 
         processed_chunks += 1
         entities_count = len(maybe_nodes)
         relations_count = len(maybe_edges)
-        log_message = f"Chunk {processed_chunks} of {total_chunks} extracted {entities_count} Ent + {relations_count} Rel {chunk_key}"
+        chunk_duration = time.perf_counter() - chunk_start
+        timing_details = (
+            f"total={chunk_duration:.2f}s, wait={queue_wait:.2f}s, "
+            f"llm={llm_duration:.2f}s, parse={parse_duration:.2f}s"
+        )
+        if entity_extract_max_gleaning > 0:
+            timing_details += (
+                f", glean={glean_duration:.2f}s, "
+                f"glean_parse={glean_parse_duration:.2f}s"
+            )
+        if cache_update_duration > 0:
+            timing_details += f", cache={cache_update_duration:.2f}s"
+        log_message = (
+            f"Chunk {processed_chunks} of {total_chunks} extracted "
+            f"{entities_count} Ent + {relations_count} Rel {chunk_key} "
+            f"({timing_details})"
+        )
         logger.info(log_message)
         if pipeline_status is not None:
             async with pipeline_status_lock:
@@ -2944,12 +3189,13 @@ async def extract_entities(
         # Return the extracted nodes and edges for centralized processing
         return maybe_nodes, maybe_edges
 
-    # Get max async tasks limit from global_config
-    chunk_max_async = global_config.get("llm_model_max_async", 4)
+    # Create semaphore for chunk processing concurrency
     semaphore = asyncio.Semaphore(chunk_max_async)
 
     async def _process_with_semaphore(chunk):
+        queue_start = time.perf_counter()
         async with semaphore:
+            queue_wait = time.perf_counter() - queue_start
             # Check for cancellation before processing chunk
             if pipeline_status is not None and pipeline_status_lock is not None:
                 async with pipeline_status_lock:
@@ -2959,7 +3205,7 @@ async def extract_entities(
                         )
 
             try:
-                return await _process_single_content(chunk)
+                return await _process_single_content(chunk, queue_wait)
             except Exception as e:
                 chunk_id = chunk[0]  # Extract chunk_id from chunk[0]
                 prefixed_exception = create_prefixed_exception(e, chunk_id)
@@ -3008,6 +3254,20 @@ async def extract_entities(
         raise prefixed_exception from first_exception
 
     # If all tasks completed successfully, chunk_results already contains the results
+    extract_duration = time.perf_counter() - extract_start
+    average_duration = (
+        extract_duration / total_chunks if total_chunks > 0 else 0.0
+    )
+    log_message = (
+        f"Entity extraction completed: {processed_chunks}/{total_chunks} chunks "
+        f"in {extract_duration:.2f}s (avg={average_duration:.2f}s)"
+    )
+    logger.info(log_message)
+    if pipeline_status is not None and pipeline_status_lock is not None:
+        async with pipeline_status_lock:
+            pipeline_status["latest_message"] = log_message
+            pipeline_status["history_messages"].append(log_message)
+
     # Return the chunk_results for later processing in merge_nodes_and_edges
     return chunk_results
 
