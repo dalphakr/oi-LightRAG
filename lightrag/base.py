@@ -168,6 +168,11 @@ class QueryParam:
     containing citation information for the retrieved content.
     """
 
+    enable_llm_filter: bool = (
+        os.getenv("ENABLE_LLM_FILTER", "false").lower() == "true"
+    )
+    """If True, applies an LLM-based relevance filter before building the final context."""
+
 
 @dataclass
 class StorageNameSpace(ABC):

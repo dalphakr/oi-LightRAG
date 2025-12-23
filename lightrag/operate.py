@@ -1,11 +1,12 @@
 from __future__ import annotations
 from functools import partial
 from pathlib import Path
+import re
 
 import asyncio
 import json
 import json_repair
-from typing import Any, AsyncIterator, overload, Literal
+from typing import Any, AsyncIterator, Callable, overload, Literal
 from collections import Counter, defaultdict
 
 from lightrag.exceptions import (
@@ -14,6 +15,7 @@ from lightrag.exceptions import (
 )
 from lightrag.utils import (
     logger,
+    verbose_debug,
     compute_mdhash_id,
     Tokenizer,
     is_float_regex,
@@ -36,6 +38,7 @@ from lightrag.utils import (
     fix_tuple_delimiter_corruption,
     convert_to_user_format,
     generate_reference_list_from_chunks,
+    get_content_summary,
     apply_source_ids_limit,
     merge_source_ids,
     make_relation_chunk_key,
@@ -55,6 +58,8 @@ from lightrag.constants import (
     DEFAULT_MAX_ENTITY_TOKENS,
     DEFAULT_MAX_RELATION_TOKENS,
     DEFAULT_MAX_TOTAL_TOKENS,
+    DEFAULT_LLM_FILTER_RELATION_BATCH_SIZE,
+    DEFAULT_LLM_FILTER_CHUNK_BATCH_SIZE,
     DEFAULT_RELATED_CHUNK_NUMBER,
     DEFAULT_KG_CHUNK_PICK_METHOD,
     DEFAULT_ENTITY_TYPES,
@@ -3096,6 +3101,7 @@ async def kg_query(
         relationships_vdb,
         text_chunks_db,
         query_param,
+        hashing_kv,
         chunks_vdb,
     )
 
@@ -3129,6 +3135,11 @@ async def kg_query(
     if query_param.only_need_prompt:
         prompt_content = "\n\n".join([sys_prompt, "---User Query---", user_query])
         return QueryResult(content=prompt_content, raw_data=context_result.raw_data)
+
+    if context_result.raw_data and context_result.raw_data.get("status") == "failure":
+        return QueryResult(
+            content=PROMPTS["fail_response"], raw_data=context_result.raw_data
+        )
 
     # Call LLM
     tokenizer: Tokenizer = global_config["tokenizer"]
@@ -3863,6 +3874,570 @@ async def _merge_all_chunks(
     return merged_chunks
 
 
+def _compact_filter_text(text: str, max_length: int) -> str:
+    if not text:
+        return ""
+    compact = " ".join(str(text).split())
+    return get_content_summary(compact, max_length=max_length)
+
+
+def _format_filter_history(history_messages: list[dict[str, str]] | None) -> str:
+    if not history_messages:
+        return ""
+
+    lines = []
+    for message in history_messages:
+        role = str(message.get("role", "")).strip()
+        content = _compact_filter_text(message.get("content", ""), max_length=160)
+        if not content:
+            continue
+        if role:
+            lines.append(f"{role}:{content}")
+        else:
+            lines.append(content)
+    return "\n".join(lines)
+
+
+def _format_filter_entities(entities_context: list[dict]) -> str:
+    lines = []
+    for idx, entity in enumerate(entities_context, start=1):
+        name = _compact_filter_text(entity.get("entity", ""), max_length=80)
+        entity_type = _compact_filter_text(entity.get("type", ""), max_length=40)
+        description = _compact_filter_text(entity.get("description", ""), max_length=160)
+        parts = [str(idx), name, entity_type, description]
+        lines.append("|".join(part for part in parts if part))
+    return "\n".join(lines)
+
+
+def _format_filter_relations(relations_context: list[dict]) -> str:
+    lines = []
+    for idx, relation in enumerate(relations_context, start=1):
+        entity1 = _compact_filter_text(relation.get("entity1", ""), max_length=80)
+        entity2 = _compact_filter_text(relation.get("entity2", ""), max_length=80)
+        description = _compact_filter_text(
+            relation.get("description", ""), max_length=160
+        )
+        parts = [str(idx), entity1, entity2, description]
+        lines.append("|".join(part for part in parts if part))
+    return "\n".join(lines)
+
+
+def _format_filter_chunks(chunks: list[dict]) -> str:
+    lines = []
+    for idx, chunk in enumerate(chunks, start=1):
+        summary = _compact_filter_text(chunk.get("content", ""), max_length=220)
+        if summary:
+            lines.append(f"{idx}|{summary}")
+        else:
+            lines.append(str(idx))
+    return "\n".join(lines)
+
+
+def _parse_filter_indices(
+    filter_output: str, counts: tuple[int, int, int]
+) -> tuple[list[int], list[int], list[int]]:
+    cleaned = remove_think_tags(filter_output or "")
+    lines = cleaned.splitlines()
+    if not lines:
+        return [], [], []
+
+    while len(lines) < 3:
+        lines.append("")
+    lines = lines[:3]
+
+    results = []
+    for line, max_count in zip(lines, counts):
+        indices = []
+        seen = set()
+        for match in re.findall(r"\d+", line):
+            idx = int(match)
+            if 1 <= idx <= max_count and idx not in seen:
+                seen.add(idx)
+                indices.append(idx)
+        results.append(indices)
+
+    return results[0], results[1], results[2]
+
+
+def _parse_filter_indices_line(filter_output: str, max_count: int) -> list[int]:
+    cleaned = remove_think_tags(filter_output or "")
+    indices = []
+    seen = set()
+    for match in re.findall(r"\d+", cleaned):
+        idx = int(match)
+        if 1 <= idx <= max_count and idx not in seen:
+            seen.add(idx)
+            indices.append(idx)
+    return indices
+
+
+def _filter_entity_mapping(
+    entity_id_to_original: dict | None, entities_context: list[dict]
+) -> dict:
+    if not entity_id_to_original:
+        return {}
+    entity_names = {entity.get("entity") for entity in entities_context}
+    return {
+        name: original
+        for name, original in entity_id_to_original.items()
+        if name in entity_names
+    }
+
+
+def _filter_relation_mapping(
+    relation_id_to_original: dict | None, relations_context: list[dict]
+) -> dict:
+    if not relation_id_to_original:
+        return {}
+    relation_pairs = {
+        (relation.get("entity1"), relation.get("entity2"))
+        for relation in relations_context
+    }
+    return {
+        pair: original
+        for pair, original in relation_id_to_original.items()
+        if pair in relation_pairs
+    }
+
+
+def _derive_entities_from_relations(
+    relations_context: list[dict], entities_context: list[dict]
+) -> list[dict]:
+    if not relations_context:
+        return []
+
+    entity_lookup = {}
+    for entity in entities_context:
+        name = entity.get("entity")
+        if name and name not in entity_lookup:
+            entity_lookup[name] = entity
+
+    derived_entities = []
+    seen = set()
+    for relation in relations_context:
+        for key in ("entity1", "entity2"):
+            name = relation.get(key)
+            if not name or name in seen:
+                continue
+            seen.add(name)
+            entity = entity_lookup.get(name)
+            if entity:
+                derived_entities.append(entity)
+            else:
+                derived_entities.append(
+                    {
+                        "entity": name,
+                        "type": "UNKNOWN",
+                        "description": "UNKNOWN",
+                        "created_at": "UNKNOWN",
+                        "file_path": "unknown_source",
+                    }
+                )
+
+    return derived_entities
+
+
+async def _apply_llm_context_filter(
+    query: str,
+    entities_context: list[dict],
+    relations_context: list[dict],
+    chunks: list[dict],
+    query_param: QueryParam,
+    global_config: dict[str, str],
+    hashing_kv: BaseKVStorage | None = None,
+) -> tuple[list[dict], list[dict], list[dict], dict[str, Any]]:
+    input_counts = {
+        "entities": len(entities_context),
+        "relations": len(relations_context),
+        "chunks": len(chunks),
+    }
+    relation_meta: dict[str, Any] = {
+        "status": "skipped",
+        "input_count": len(relations_context),
+        "output_count": len(relations_context),
+    }
+    chunk_meta: dict[str, Any] = {
+        "status": "skipped",
+        "input_count": len(chunks),
+        "output_count": len(chunks),
+    }
+    filter_metadata: dict[str, Any] = {
+        "enabled": bool(query_param.enable_llm_filter),
+        "status": "skipped",
+        "input_counts": input_counts,
+        "output_counts": dict(input_counts),
+        "relations": relation_meta,
+        "chunks": chunk_meta,
+    }
+
+    if not relations_context and not chunks:
+        filter_metadata["status"] = "skipped_empty"
+        relation_meta["status"] = "skipped_empty"
+        relation_meta["output_count"] = 0
+        chunk_meta["status"] = "skipped_empty"
+        chunk_meta["output_count"] = 0
+        derived_entities = _derive_entities_from_relations(
+            relations_context, entities_context
+        )
+        filter_metadata["output_counts"] = {
+            "entities": len(derived_entities),
+            "relations": len(relations_context),
+            "chunks": len(chunks),
+        }
+        return derived_entities, relations_context, chunks, filter_metadata
+
+    if not query_param.enable_llm_filter:
+        derived_entities = _derive_entities_from_relations(
+            relations_context, entities_context
+        )
+        filter_metadata["output_counts"] = {
+            "entities": len(derived_entities),
+            "relations": len(relations_context),
+            "chunks": len(chunks),
+        }
+        return derived_entities, relations_context, chunks, filter_metadata
+
+    history_block = _format_filter_history(query_param.conversation_history)
+
+    def _resolve_batch_size(
+        param_value: int | None, config_key: str, default_value: int
+    ) -> int:
+        if param_value is None:
+            param_value = global_config.get(config_key)
+        if param_value is None:
+            param_value = default_value
+        try:
+            batch_size = int(param_value)
+        except (TypeError, ValueError):
+            batch_size = default_value
+        return max(1, batch_size)
+
+    relation_batch_size = _resolve_batch_size(
+        getattr(query_param, "llm_filter_relation_batch_size", None),
+        "llm_filter_relation_batch_size",
+        DEFAULT_LLM_FILTER_RELATION_BATCH_SIZE,
+    )
+    chunk_batch_size = _resolve_batch_size(
+        getattr(query_param, "llm_filter_chunk_batch_size", None),
+        "llm_filter_chunk_batch_size",
+        DEFAULT_LLM_FILTER_CHUNK_BATCH_SIZE,
+    )
+
+    def _split_batches(
+        items: list[dict], batch_size: int
+    ) -> list[tuple[int, int, list[dict]]]:
+        return [
+            (batch_id, start, items[start : start + batch_size])
+            for batch_id, start in enumerate(
+                range(0, len(items), batch_size), start=1
+            )
+        ]
+
+    def _select_llm_filter_func(config_key: str) -> Callable[..., object] | None:
+        use_llm_func = global_config.get(config_key)
+        if use_llm_func is None:
+            use_llm_func = global_config.get("llm_filter_model_func")
+        if use_llm_func is None:
+            use_llm_func = global_config.get("llm_model_func")
+        if use_llm_func is None:
+            return None
+        return partial(use_llm_func, _priority=6)
+
+    async def _run_relation_filter() -> tuple[list[dict], dict[str, Any]]:
+        start_time = time.monotonic()
+        meta = {
+            "status": "skipped",
+            "input_count": len(relations_context),
+            "output_count": 0,
+        }
+        if not relations_context:
+            meta["status"] = "skipped_empty"
+            meta["duration_ms"] = int((time.monotonic() - start_time) * 1000)
+            logger.info(
+                "[llm_filter] Relation filter skipped (empty) in %dms",
+                meta["duration_ms"],
+            )
+            return [], meta
+
+        use_llm_func = _select_llm_filter_func("llm_relation_filter_model_func")
+        if use_llm_func is None:
+            meta["status"] = "error"
+            meta["error"] = "missing_llm_relation_filter_model_func"
+            meta["duration_ms"] = int((time.monotonic() - start_time) * 1000)
+            logger.info(
+                "[llm_filter] Relation filter error in %dms: %s",
+                meta["duration_ms"],
+                meta["error"],
+            )
+            return [], meta
+        batches = _split_batches(relations_context, relation_batch_size)
+        meta["batch_size"] = relation_batch_size
+        meta["batch_count"] = len(batches)
+
+        async def _run_relation_batch(
+            batch_id: int, start_index: int, batch_relations: list[dict]
+        ) -> tuple[list[int], str | None]:
+            batch_start = time.monotonic()
+            batch_block = _format_filter_relations(batch_relations)
+            user_prompt_parts = [f"Query:\n{query}"]
+            if history_block:
+                user_prompt_parts.append(f"History:\n{history_block}")
+            user_prompt_parts.append(f"Relations:\n{batch_block}")
+            user_prompt = "\n\n".join(user_prompt_parts)
+            verbose_debug(
+                "[llm_filter] Relation batch %d/%d prompt:\n%s",
+                batch_id,
+                len(batches),
+                user_prompt,
+            )
+
+            try:
+                llm_start = time.monotonic()
+                filter_output, _ = await use_llm_func_with_cache(
+                    user_prompt,
+                    use_llm_func,
+                    llm_response_cache=hashing_kv,
+                    system_prompt=PROMPTS["context_filter_relations"],
+                    max_tokens=128,
+                    cache_type="filter_relation",
+                )
+            except Exception as e:
+                llm_ms = int((time.monotonic() - llm_start) * 1000)
+                total_ms = int((time.monotonic() - batch_start) * 1000)
+                logger.error(f"[llm_filter] Failed to filter relations: {e}")
+                logger.debug(
+                    "[llm_filter] Relation batch %d/%d error in %dms (llm:%dms)",
+                    batch_id,
+                    len(batches),
+                    total_ms,
+                    llm_ms,
+                )
+                return [], str(e)
+
+            relation_indices = _parse_filter_indices_line(
+                filter_output, len(batch_relations)
+            )
+            verbose_debug(
+                "[llm_filter] Relation batch %d/%d output:\n%s",
+                batch_id,
+                len(batches),
+                filter_output,
+            )
+            total_ms = int((time.monotonic() - batch_start) * 1000)
+            llm_ms = int((time.monotonic() - llm_start) * 1000)
+            overhead_ms = max(0, total_ms - llm_ms)
+            logger.debug(
+                "[llm_filter] Relation batch %d/%d: %d -> %d (llm:%dms total:%dms overhead:%dms)",
+                batch_id,
+                len(batches),
+                len(batch_relations),
+                len(relation_indices),
+                llm_ms,
+                total_ms,
+                overhead_ms,
+            )
+            return [start_index + idx for idx in relation_indices], None
+
+        results = await asyncio.gather(
+            *[
+                _run_relation_batch(batch_id, start_index, batch_relations)
+                for batch_id, start_index, batch_relations in batches
+            ]
+        )
+        relation_indices = []
+        errors = []
+        for batch_indices, error in results:
+            relation_indices.extend(batch_indices)
+            if error:
+                errors.append(error)
+
+        unique_indices = sorted(set(relation_indices))
+        filtered_relations = [relations_context[i - 1] for i in unique_indices]
+        meta["output_count"] = len(filtered_relations)
+        if errors:
+            meta["status"] = "error"
+            meta["error"] = errors[0]
+        elif not filtered_relations:
+            meta["status"] = "empty"
+        else:
+            meta["status"] = "success"
+        meta["duration_ms"] = int((time.monotonic() - start_time) * 1000)
+        logger.info(
+            "[llm_filter] Relation filter %s: %d -> %d (batches:%d) in %dms",
+            meta["status"],
+            meta["input_count"],
+            meta["output_count"],
+            meta.get("batch_count", 0),
+            meta["duration_ms"],
+        )
+        return filtered_relations, meta
+
+    async def _run_chunk_filter() -> tuple[list[dict], dict[str, Any]]:
+        start_time = time.monotonic()
+        meta = {
+            "status": "skipped",
+            "input_count": len(chunks),
+            "output_count": 0,
+        }
+        if not chunks:
+            meta["status"] = "skipped_empty"
+            meta["duration_ms"] = int((time.monotonic() - start_time) * 1000)
+            logger.info(
+                "[llm_filter] Chunk filter skipped (empty) in %dms",
+                meta["duration_ms"],
+            )
+            return [], meta
+
+        use_llm_func = _select_llm_filter_func("llm_chunk_filter_model_func")
+        if use_llm_func is None:
+            meta["status"] = "error"
+            meta["error"] = "missing_llm_chunk_filter_model_func"
+            meta["duration_ms"] = int((time.monotonic() - start_time) * 1000)
+            logger.info(
+                "[llm_filter] Chunk filter error in %dms: %s",
+                meta["duration_ms"],
+                meta["error"],
+            )
+            return [], meta
+        batches = _split_batches(chunks, chunk_batch_size)
+        meta["batch_size"] = chunk_batch_size
+        meta["batch_count"] = len(batches)
+
+        async def _run_chunk_batch(
+            batch_id: int, start_index: int, batch_chunks: list[dict]
+        ) -> tuple[list[int], str | None]:
+            batch_start = time.monotonic()
+            batch_block = _format_filter_chunks(batch_chunks)
+            user_prompt_parts = [f"Query:\n{query}"]
+            if history_block:
+                user_prompt_parts.append(f"History:\n{history_block}")
+            user_prompt_parts.append(f"Chunks:\n{batch_block}")
+            user_prompt = "\n\n".join(user_prompt_parts)
+            verbose_debug(
+                "[llm_filter] Chunk batch %d/%d prompt:\n%s",
+                batch_id,
+                len(batches),
+                user_prompt,
+            )
+
+            try:
+                llm_start = time.monotonic()
+                filter_output, _ = await use_llm_func_with_cache(
+                    user_prompt,
+                    use_llm_func,
+                    llm_response_cache=hashing_kv,
+                    system_prompt=PROMPTS["context_filter_chunks"],
+                    max_tokens=128,
+                    cache_type="filter_chunk",
+                )
+            except Exception as e:
+                llm_ms = int((time.monotonic() - llm_start) * 1000)
+                total_ms = int((time.monotonic() - batch_start) * 1000)
+                logger.error(f"[llm_filter] Failed to filter chunks: {e}")
+                logger.debug(
+                    "[llm_filter] Chunk batch %d/%d error in %dms (llm:%dms)",
+                    batch_id,
+                    len(batches),
+                    total_ms,
+                    llm_ms,
+                )
+                return [], str(e)
+
+            chunk_indices = _parse_filter_indices_line(
+                filter_output, len(batch_chunks)
+            )
+            verbose_debug(
+                "[llm_filter] Chunk batch %d/%d output:\n%s",
+                batch_id,
+                len(batches),
+                filter_output,
+            )
+            total_ms = int((time.monotonic() - batch_start) * 1000)
+            llm_ms = int((time.monotonic() - llm_start) * 1000)
+            overhead_ms = max(0, total_ms - llm_ms)
+            logger.debug(
+                "[llm_filter] Chunk batch %d/%d: %d -> %d (llm:%dms total:%dms overhead:%dms)",
+                batch_id,
+                len(batches),
+                len(batch_chunks),
+                len(chunk_indices),
+                llm_ms,
+                total_ms,
+                overhead_ms,
+            )
+            return [start_index + idx for idx in chunk_indices], None
+
+        results = await asyncio.gather(
+            *[
+                _run_chunk_batch(batch_id, start_index, batch_chunks)
+                for batch_id, start_index, batch_chunks in batches
+            ]
+        )
+        chunk_indices = []
+        errors = []
+        for batch_indices, error in results:
+            chunk_indices.extend(batch_indices)
+            if error:
+                errors.append(error)
+
+        unique_indices = sorted(set(chunk_indices))
+        filtered_chunks = [chunks[i - 1] for i in unique_indices]
+        meta["output_count"] = len(filtered_chunks)
+        if errors:
+            meta["status"] = "error"
+            meta["error"] = errors[0]
+        elif not filtered_chunks:
+            meta["status"] = "empty"
+        else:
+            meta["status"] = "success"
+        meta["duration_ms"] = int((time.monotonic() - start_time) * 1000)
+        logger.info(
+            "[llm_filter] Chunk filter %s: %d -> %d (batches:%d) in %dms",
+            meta["status"],
+            meta["input_count"],
+            meta["output_count"],
+            meta.get("batch_count", 0),
+            meta["duration_ms"],
+        )
+        return filtered_chunks, meta
+
+    total_start_time = time.monotonic()
+    (filtered_relations, relation_meta), (filtered_chunks, chunk_meta) = (
+        await asyncio.gather(_run_relation_filter(), _run_chunk_filter())
+    )
+    filter_metadata["duration_ms"] = int(
+        (time.monotonic() - total_start_time) * 1000
+    )
+    logger.info(
+        "[llm_filter] Total filter time %dms (relations:%s chunks:%s)",
+        filter_metadata["duration_ms"],
+        relation_meta.get("status"),
+        chunk_meta.get("status"),
+    )
+
+    derived_entities = _derive_entities_from_relations(
+        filtered_relations, entities_context
+    )
+    filter_metadata["relations"] = relation_meta
+    filter_metadata["chunks"] = chunk_meta
+    filter_metadata["output_counts"] = {
+        "entities": len(derived_entities),
+        "relations": len(filtered_relations),
+        "chunks": len(filtered_chunks),
+    }
+
+    if relation_meta["status"] == "error" or chunk_meta["status"] == "error":
+        filter_metadata["status"] = "error"
+        return derived_entities, filtered_relations, filtered_chunks, filter_metadata
+
+    if not filtered_relations and not filtered_chunks:
+        filter_metadata["status"] = "empty"
+        return derived_entities, filtered_relations, filtered_chunks, filter_metadata
+
+    filter_metadata["status"] = "success"
+    return derived_entities, filtered_relations, filtered_chunks, filter_metadata
+
+
 async def _build_context_str(
     entities_context: list[dict],
     relations_context: list[dict],
@@ -3870,6 +4445,7 @@ async def _build_context_str(
     query: str,
     query_param: QueryParam,
     global_config: dict[str, str],
+    hashing_kv: BaseKVStorage | None = None,
     chunk_tracking: dict = None,
     entity_id_to_original: dict = None,
     relation_id_to_original: dict = None,
@@ -3958,6 +4534,34 @@ async def _build_context_str(
         chunk_token_limit=available_chunk_tokens,  # Pass dynamic limit
     )
 
+    (
+        entities_context,
+        relations_context,
+        truncated_chunks,
+        filter_metadata,
+    ) = await _apply_llm_context_filter(
+        query=query,
+        entities_context=entities_context,
+        relations_context=relations_context,
+        chunks=truncated_chunks,
+        query_param=query_param,
+        global_config=global_config,
+        hashing_kv=hashing_kv,
+    )
+    entity_id_to_original = _filter_entity_mapping(
+        entity_id_to_original, entities_context
+    )
+    relation_id_to_original = _filter_relation_mapping(
+        relation_id_to_original, relations_context
+    )
+
+    entities_str = "\n".join(
+        json.dumps(entity, ensure_ascii=False) for entity in entities_context
+    )
+    relations_str = "\n".join(
+        json.dumps(relation, ensure_ascii=False) for relation in relations_context
+    )
+
     # Generate reference list from truncated chunks using the new common function
     reference_list, truncated_chunks = generate_reference_list_from_chunks(
         truncated_chunks
@@ -3999,6 +4603,9 @@ async def _build_context_str(
         )
         empty_raw_data["status"] = "failure"
         empty_raw_data["message"] = "Query returned empty dataset."
+        if "metadata" not in empty_raw_data:
+            empty_raw_data["metadata"] = {}
+        empty_raw_data["metadata"]["filtering"] = filter_metadata
         return "", empty_raw_data
 
     # output chunks tracking infomations
@@ -4039,6 +4646,9 @@ async def _build_context_str(
         entity_id_to_original,
         relation_id_to_original,
     )
+    if "metadata" not in final_data:
+        final_data["metadata"] = {}
+    final_data["metadata"]["filtering"] = filter_metadata
     logger.debug(
         f"[_build_context_str] Final data after conversion: {len(final_data.get('entities', []))} entities, {len(final_data.get('relationships', []))} relationships, {len(final_data.get('chunks', []))} chunks"
     )
@@ -4055,6 +4665,7 @@ async def _build_query_context(
     relationships_vdb: BaseVectorStorage,
     text_chunks_db: BaseKVStorage,
     query_param: QueryParam,
+    hashing_kv: BaseKVStorage | None = None,
     chunks_vdb: BaseVectorStorage = None,
 ) -> QueryContextResult | None:
     """
@@ -4125,6 +4736,7 @@ async def _build_query_context(
         query=query,
         query_param=query_param,
         global_config=text_chunks_db.global_config,
+        hashing_kv=hashing_kv,
         chunk_tracking=search_result["chunk_tracking"],
         entity_id_to_original=truncation_result["entity_id_to_original"],
         relation_id_to_original=truncation_result["relation_id_to_original"],
@@ -4856,6 +5468,16 @@ async def naive_query(
         chunk_token_limit=available_chunk_tokens,  # Pass dynamic limit
     )
 
+    _, _, processed_chunks, filter_metadata = await _apply_llm_context_filter(
+        query=query,
+        entities_context=[],
+        relations_context=[],
+        chunks=processed_chunks,
+        query_param=query_param,
+        global_config=global_config,
+        hashing_kv=hashing_kv,
+    )
+
     # Generate reference list from processed chunks using the new common function
     reference_list, processed_chunks_with_ref_ids = generate_reference_list_from_chunks(
         processed_chunks
@@ -4871,6 +5493,12 @@ async def naive_query(
         reference_list,
         "naive",
     )
+    if "metadata" not in raw_data:
+        raw_data["metadata"] = {}
+    raw_data["metadata"]["filtering"] = filter_metadata
+    if not processed_chunks_with_ref_ids:
+        raw_data["status"] = "failure"
+        raw_data["message"] = "Query returned empty dataset."
 
     # Add complete metadata for naive mode
     if "metadata" not in raw_data:
@@ -4923,6 +5551,9 @@ async def naive_query(
     if query_param.only_need_prompt:
         prompt_content = "\n\n".join([sys_prompt, "---User Query---", user_query])
         return QueryResult(content=prompt_content, raw_data=raw_data)
+
+    if raw_data.get("status") == "failure":
+        return QueryResult(content=PROMPTS["fail_response"], raw_data=raw_data)
 
     # Handle cache
     args_hash = compute_args_hash(

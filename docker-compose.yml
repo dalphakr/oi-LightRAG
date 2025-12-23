@@ -24,7 +24,7 @@ services:
     env_file:
       - .env
     environment:
-      - LIGHTRAG_API_MODE=index
+      - LIGHTRAG_API_MODE=full
     restart: unless-stopped
     extra_hosts:
       - "host.docker.internal:host-gateway"

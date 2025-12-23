@@ -47,6 +47,8 @@ DEFAULT_CHUNK_TOP_K = 20
 DEFAULT_MAX_ENTITY_TOKENS = 6000
 DEFAULT_MAX_RELATION_TOKENS = 8000
 DEFAULT_MAX_TOTAL_TOKENS = 30000
+DEFAULT_LLM_FILTER_RELATION_BATCH_SIZE = 10
+DEFAULT_LLM_FILTER_CHUNK_BATCH_SIZE = 10
 DEFAULT_COSINE_THRESHOLD = 0.2
 DEFAULT_RELATED_CHUNK_NUMBER = 5
 DEFAULT_KG_CHUNK_PICK_METHOD = "VECTOR"
@@ -84,8 +86,8 @@ DEFAULT_FILE_PATH_MORE_PLACEHOLDER = "truncated"
 DEFAULT_TEMPERATURE = 1.0
 
 # Async configuration defaults
-DEFAULT_MAX_ASYNC = 4  # Default maximum async operations
-DEFAULT_MAX_PARALLEL_INSERT = 2  # Default maximum parallel insert operations
+DEFAULT_MAX_ASYNC = 16  # Default maximum async operations
+DEFAULT_MAX_PARALLEL_INSERT = 8  # Default maximum parallel insert operations
 
 # Embedding configuration defaults
 DEFAULT_EMBEDDING_FUNC_MAX_ASYNC = 8  # Default max async for embedding functions
