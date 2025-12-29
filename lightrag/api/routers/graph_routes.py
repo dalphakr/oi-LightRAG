@@ -106,6 +106,40 @@ def create_graph_routes(rag, api_key: Optional[str] = None):
                 status_code=500, detail=f"Error getting graph labels: {str(e)}"
             )
 
+    @router.get("/graph/label/list/details", dependencies=[Depends(combined_auth)])
+    async def get_graph_label_details():
+        """
+        Get all graph labels with entity type and description
+
+        Returns:
+            List[dict]: List of label metadata entries
+        """
+        try:
+            nodes = await rag.chunk_entity_relation_graph.get_all_nodes()
+            details = []
+            for node in nodes:
+                if not isinstance(node, dict):
+                    continue
+                label = node.get("entity_id") or node.get("id") or node.get("_id")
+                if label is None:
+                    continue
+                details.append(
+                    {
+                        "label": str(label),
+                        "entity_type": node.get("entity_type"),
+                        "description": node.get("description"),
+                    }
+                )
+            details.sort(key=lambda item: item["label"])
+            return details
+        except Exception as e:
+            logger.error(f"Error getting graph label details: {str(e)}")
+            logger.error(traceback.format_exc())
+            raise HTTPException(
+                status_code=500,
+                detail=f"Error getting graph label details: {str(e)}",
+            )
+
     @router.get("/graph/label/popular", dependencies=[Depends(combined_auth)])
     async def get_popular_labels(
         limit: int = Query(

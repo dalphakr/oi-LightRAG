@@ -2384,6 +2384,33 @@ class PGVectorStorage(BaseVectorStorage):
                 f"Consider using a shorter embedding model name or workspace name."
             )
 
+    def _normalize_vector_record(self, record: dict[str, Any]) -> dict[str, Any]:
+        if not record:
+            return record
+
+        vector = record.get("content_vector")
+        if vector is None:
+            return record
+
+        try:
+            if isinstance(vector, (list, tuple)):
+                record["content_vector"] = list(vector)
+            elif isinstance(vector, str):
+                parsed = json.loads(vector)
+                if isinstance(parsed, list):
+                    record["content_vector"] = parsed
+            elif hasattr(vector, "tolist"):
+                record["content_vector"] = vector.tolist()
+            else:
+                record["content_vector"] = str(vector)
+        except (TypeError, ValueError, json.JSONDecodeError) as e:
+            logger.warning(
+                f"[{self.workspace}] Failed to normalize content_vector for {self.namespace}: {e}"
+            )
+            record["content_vector"] = str(vector)
+
+        return record
+
     @staticmethod
     async def _pg_create_table(
         db: PostgreSQLDB, table_name: str, base_table: str, embedding_dim: int
@@ -3079,7 +3106,7 @@ class PGVectorStorage(BaseVectorStorage):
         try:
             result = await self.db.query(query, list(params.values()))
             if result:
-                return dict(result)
+                return self._normalize_vector_record(dict(result))
             return None
         except Exception as e:
             logger.error(
@@ -3113,7 +3140,7 @@ class PGVectorStorage(BaseVectorStorage):
             for record in results:
                 if record is None:
                     continue
-                record_dict = dict(record)
+                record_dict = self._normalize_vector_record(dict(record))
                 row_id = record_dict.get("id")
                 if row_id is not None:
                     id_map[str(row_id)] = record_dict
