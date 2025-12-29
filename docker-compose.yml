@@ -1,4 +1,28 @@
 services:
+  postgres:
+    image: lightrag-postgres:pg16
+    container_name: lightrag-postgres
+    build:
+      context: ./docker/postgres
+      dockerfile: Dockerfile
+      args:
+        PG_UID: ${POSTGRES_UID:-1024}
+        PG_GID: ${POSTGRES_GID:-100}
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-lightrag}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-lightrag}
+      POSTGRES_DB: ${POSTGRES_DATABASE:-lightrag}
+    ports:
+      - "5432:5432"
+    volumes:
+      - /nas/data/sangmin/oi/lightrag/postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+
   lightrag:
     container_name: lightrag
     image: ghcr.io/hkuds/lightrag:latest
@@ -25,6 +49,11 @@ services:
       - .env
     environment:
       - LIGHTRAG_API_MODE=full
+      - POSTGRES_HOST=postgres
+      - POSTGRES_PORT=5432
+    depends_on:
+      postgres:
+        condition: service_healthy
     restart: unless-stopped
     extra_hosts:
       - "host.docker.internal:host-gateway"

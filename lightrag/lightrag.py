@@ -1786,12 +1786,36 @@ class LightRAG:
                     processing_start_time = int(time.time())
                     first_stage_tasks = []
                     entity_relation_task = None
+                    semaphore_wait_start = time.perf_counter()
 
                     async with semaphore:
                         nonlocal processed_count
                         # Initialize to prevent UnboundLocalError in error handling
                         first_stage_tasks = []
                         entity_relation_task = None
+                        content_fetch_duration = 0.0
+                        chunking_duration = 0.0
+                        stage1_duration = 0.0
+                        extract_duration = 0.0
+                        merge_duration = 0.0
+                        persist_duration = 0.0
+                        doc_timing_start = time.perf_counter()
+                        semaphore_wait_duration = (
+                            doc_timing_start - semaphore_wait_start
+                        )
+
+                        async def _timed_op(
+                            operation_name: str, coro: Awaitable[Any]
+                        ) -> Any:
+                            op_start = time.perf_counter()
+                            try:
+                                return await coro
+                            finally:
+                                op_duration = time.perf_counter() - op_start
+                                logger.info(
+                                    f"{operation_name} {current_file_number}/{total_files}: "
+                                    f"{op_duration:.2f}s"
+                                )
                         try:
                             # Check for cancellation before starting document processing
                             async with pipeline_status_lock:
@@ -1828,8 +1852,17 @@ class LightRAG:
                                         pipeline_status["history_messages"][-5000:]
                                     )
 
+                            logger.info(
+                                f"Queue wait {current_file_number}/{total_files}: "
+                                f"{semaphore_wait_duration:.2f}s (doc_id={doc_id})"
+                            )
+
                             # Get document content from full_docs
+                            content_fetch_start = time.perf_counter()
                             content_data = await self.full_docs.get_by_id(doc_id)
+                            content_fetch_duration = (
+                                time.perf_counter() - content_fetch_start
+                            )
                             if not content_data:
                                 raise Exception(
                                     f"Document content not found in full_docs for doc_id: {doc_id}"
@@ -1837,6 +1870,7 @@ class LightRAG:
                             content = content_data["content"]
 
                             # Call chunking function, supporting both sync and async implementations
+                            chunking_start = time.perf_counter()
                             chunking_result = self.chunking_func(
                                 self.tokenizer,
                                 content,
@@ -1867,6 +1901,14 @@ class LightRAG:
                                 }
                                 for dp in chunking_result
                             }
+                            chunking_duration = time.perf_counter() - chunking_start
+
+                            logger.info(
+                                f"Prepared chunks {current_file_number}/{total_files}: "
+                                f"load={content_fetch_duration:.2f}s, "
+                                f"chunking={chunking_duration:.2f}s, "
+                                f"chunks={len(chunks)}"
+                            )
 
                             if not chunks:
                                 logger.warning("No document chunks to process")
@@ -1882,34 +1924,43 @@ class LightRAG:
                             # Process document in two stages
                             # Stage 1: Process text chunks and docs (parallel execution)
                             doc_status_task = asyncio.create_task(
-                                self.doc_status.upsert(
-                                    {
-                                        doc_id: {
-                                            "status": DocStatus.PROCESSING,
-                                            "chunks_count": len(chunks),
-                                            "chunks_list": list(
-                                                chunks.keys()
-                                            ),  # Save chunks list
-                                            "content_summary": status_doc.content_summary,
-                                            "content_length": status_doc.content_length,
-                                            "created_at": status_doc.created_at,
-                                            "updated_at": datetime.now(
-                                                timezone.utc
-                                            ).isoformat(),
-                                            "file_path": file_path,
-                                            "track_id": status_doc.track_id,  # Preserve existing track_id
-                                            "metadata": {
-                                                "processing_start_time": processing_start_time
-                                            },
+                                _timed_op(
+                                    "Stage 1 doc_status upsert",
+                                    self.doc_status.upsert(
+                                        {
+                                            doc_id: {
+                                                "status": DocStatus.PROCESSING,
+                                                "chunks_count": len(chunks),
+                                                "chunks_list": list(
+                                                    chunks.keys()
+                                                ),  # Save chunks list
+                                                "content_summary": status_doc.content_summary,
+                                                "content_length": status_doc.content_length,
+                                                "created_at": status_doc.created_at,
+                                                "updated_at": datetime.now(
+                                                    timezone.utc
+                                                ).isoformat(),
+                                                "file_path": file_path,
+                                                "track_id": status_doc.track_id,  # Preserve existing track_id
+                                                "metadata": {
+                                                    "processing_start_time": processing_start_time
+                                                },
+                                            }
                                         }
-                                    }
+                                    ),
                                 )
                             )
                             chunks_vdb_task = asyncio.create_task(
-                                self.chunks_vdb.upsert(chunks)
+                                _timed_op(
+                                    "Stage 1 chunks_vdb upsert",
+                                    self.chunks_vdb.upsert(chunks),
+                                )
                             )
                             text_chunks_task = asyncio.create_task(
-                                self.text_chunks.upsert(chunks)
+                                _timed_op(
+                                    "Stage 1 text_chunks upsert",
+                                    self.text_chunks.upsert(chunks),
+                                )
                             )
 
                             # First stage tasks (parallel execution)
@@ -1921,15 +1972,27 @@ class LightRAG:
                             entity_relation_task = None
 
                             # Execute first stage tasks
+                            stage1_start = time.perf_counter()
                             await asyncio.gather(*first_stage_tasks)
+                            stage1_duration = time.perf_counter() - stage1_start
+                            logger.info(
+                                f"Stage 1 storage upserts {current_file_number}/{total_files}: "
+                                f"{stage1_duration:.2f}s"
+                            )
 
                             # Stage 2: Process entity relation graph (after text_chunks are saved)
+                            extract_start = time.perf_counter()
                             entity_relation_task = asyncio.create_task(
                                 self._process_extract_entities(
                                     chunks, pipeline_status, pipeline_status_lock
                                 )
                             )
                             chunk_results = await entity_relation_task
+                            extract_duration = time.perf_counter() - extract_start
+                            logger.info(
+                                f"Entity extraction completed {current_file_number}/{total_files}: "
+                                f"{extract_duration:.2f}s (chunks={len(chunks)})"
+                            )
                             file_extraction_stage_ok = True
 
                         except Exception as e:
@@ -1978,25 +2041,36 @@ class LightRAG:
                             processing_end_time = int(time.time())
 
                             # Update document status to failed
-                            await self.doc_status.upsert(
-                                {
-                                    doc_id: {
-                                        "status": DocStatus.FAILED,
-                                        "error_msg": str(e),
-                                        "content_summary": status_doc.content_summary,
-                                        "content_length": status_doc.content_length,
-                                        "created_at": status_doc.created_at,
-                                        "updated_at": datetime.now(
-                                            timezone.utc
-                                        ).isoformat(),
-                                        "file_path": file_path,
-                                        "track_id": status_doc.track_id,  # Preserve existing track_id
-                                        "metadata": {
-                                            "processing_start_time": processing_start_time,
-                                            "processing_end_time": processing_end_time,
-                                        },
+                            await _timed_op(
+                                "Doc status update FAILED (extract)",
+                                self.doc_status.upsert(
+                                    {
+                                        doc_id: {
+                                            "status": DocStatus.FAILED,
+                                            "error_msg": str(e),
+                                            "content_summary": status_doc.content_summary,
+                                            "content_length": status_doc.content_length,
+                                            "created_at": status_doc.created_at,
+                                            "updated_at": datetime.now(
+                                                timezone.utc
+                                            ).isoformat(),
+                                            "file_path": file_path,
+                                            "track_id": status_doc.track_id,  # Preserve existing track_id
+                                            "metadata": {
+                                                "processing_start_time": processing_start_time,
+                                                "processing_end_time": processing_end_time,
+                                            },
+                                        }
                                     }
-                                }
+                                ),
+                            )
+                            doc_total_duration = (
+                                time.perf_counter() - doc_timing_start
+                            )
+                            logger.info(
+                                f"Extraction failed {current_file_number}/{total_files}: "
+                                f"{doc_total_duration:.2f}s elapsed (load={content_fetch_duration:.2f}s, "
+                                f"chunking={chunking_duration:.2f}s, stage1={stage1_duration:.2f}s)"
                             )
 
                         # Concurrency is controlled by keyed lock for individual entities and relationships
@@ -2012,6 +2086,7 @@ class LightRAG:
                                         )
 
                                 # Use chunk_results from entity_relation_task
+                                merge_start = time.perf_counter()
                                 await merge_nodes_and_edges(
                                     chunk_results=chunk_results,  # result collected from entity_relation_task
                                     knowledge_graph_inst=self.chunk_entity_relation_graph,
@@ -2030,34 +2105,46 @@ class LightRAG:
                                     total_files=total_files,
                                     file_path=file_path,
                                 )
+                                merge_duration = time.perf_counter() - merge_start
+                                logger.info(
+                                    f"Merging completed {current_file_number}/{total_files}: "
+                                    f"{merge_duration:.2f}s"
+                                )
 
                                 # Record processing end time
                                 processing_end_time = int(time.time())
 
-                                await self.doc_status.upsert(
-                                    {
-                                        doc_id: {
-                                            "status": DocStatus.PROCESSED,
-                                            "chunks_count": len(chunks),
-                                            "chunks_list": list(chunks.keys()),
-                                            "content_summary": status_doc.content_summary,
-                                            "content_length": status_doc.content_length,
-                                            "created_at": status_doc.created_at,
-                                            "updated_at": datetime.now(
-                                                timezone.utc
-                                            ).isoformat(),
-                                            "file_path": file_path,
-                                            "track_id": status_doc.track_id,  # Preserve existing track_id
-                                            "metadata": {
-                                                "processing_start_time": processing_start_time,
-                                                "processing_end_time": processing_end_time,
-                                            },
+                                await _timed_op(
+                                    "Doc status update PROCESSED",
+                                    self.doc_status.upsert(
+                                        {
+                                            doc_id: {
+                                                "status": DocStatus.PROCESSED,
+                                                "chunks_count": len(chunks),
+                                                "chunks_list": list(chunks.keys()),
+                                                "content_summary": status_doc.content_summary,
+                                                "content_length": status_doc.content_length,
+                                                "created_at": status_doc.created_at,
+                                                "updated_at": datetime.now(
+                                                    timezone.utc
+                                                ).isoformat(),
+                                                "file_path": file_path,
+                                                "track_id": status_doc.track_id,  # Preserve existing track_id
+                                                "metadata": {
+                                                    "processing_start_time": processing_start_time,
+                                                    "processing_end_time": processing_end_time,
+                                                },
+                                            }
                                         }
-                                    }
+                                    ),
                                 )
 
                                 # Call _insert_done after processing each file
+                                persist_start = time.perf_counter()
                                 await self._insert_done()
+                                persist_duration = (
+                                    time.perf_counter() - persist_start
+                                )
 
                                 async with pipeline_status_lock:
                                     log_message = f"Completed processing file {current_file_number}/{total_files}: {file_path}"
@@ -2066,6 +2153,20 @@ class LightRAG:
                                     pipeline_status["history_messages"].append(
                                         log_message
                                     )
+
+                                doc_total_duration = (
+                                    time.perf_counter() - doc_timing_start
+                                )
+                                logger.info(
+                                    f"Document processed {current_file_number}/{total_files}: "
+                                    f"{doc_total_duration:.2f}s total "
+                                    f"(load={content_fetch_duration:.2f}s, "
+                                    f"chunking={chunking_duration:.2f}s, "
+                                    f"stage1={stage1_duration:.2f}s, "
+                                    f"extract={extract_duration:.2f}s, "
+                                    f"merge={merge_duration:.2f}s, "
+                                    f"persist={persist_duration:.2f}s)"
+                                )
 
                             except Exception as e:
                                 # Check if this is a user cancellation
@@ -2105,23 +2206,38 @@ class LightRAG:
                                 processing_end_time = int(time.time())
 
                                 # Update document status to failed
-                                await self.doc_status.upsert(
-                                    {
-                                        doc_id: {
-                                            "status": DocStatus.FAILED,
-                                            "error_msg": str(e),
-                                            "content_summary": status_doc.content_summary,
-                                            "content_length": status_doc.content_length,
-                                            "created_at": status_doc.created_at,
-                                            "updated_at": datetime.now().isoformat(),
-                                            "file_path": file_path,
-                                            "track_id": status_doc.track_id,  # Preserve existing track_id
-                                            "metadata": {
-                                                "processing_start_time": processing_start_time,
-                                                "processing_end_time": processing_end_time,
-                                            },
+                                await _timed_op(
+                                    "Doc status update FAILED (merge)",
+                                    self.doc_status.upsert(
+                                        {
+                                            doc_id: {
+                                                "status": DocStatus.FAILED,
+                                                "error_msg": str(e),
+                                                "content_summary": status_doc.content_summary,
+                                                "content_length": status_doc.content_length,
+                                                "created_at": status_doc.created_at,
+                                                "updated_at": datetime.now().isoformat(),
+                                                "file_path": file_path,
+                                                "track_id": status_doc.track_id,  # Preserve existing track_id
+                                                "metadata": {
+                                                    "processing_start_time": processing_start_time,
+                                                    "processing_end_time": processing_end_time,
+                                                },
+                                            }
                                         }
-                                    }
+                                    ),
+                                )
+                                doc_total_duration = (
+                                    time.perf_counter() - doc_timing_start
+                                )
+                                logger.info(
+                                    f"Merge failed {current_file_number}/{total_files}: "
+                                    f"{doc_total_duration:.2f}s elapsed "
+                                    f"(load={content_fetch_duration:.2f}s, "
+                                    f"chunking={chunking_duration:.2f}s, "
+                                    f"stage1={stage1_duration:.2f}s, "
+                                    f"extract={extract_duration:.2f}s, "
+                                    f"merge={merge_duration:.2f}s)"
                                 )
 
                 # Create processing tasks for all documents
@@ -2218,27 +2334,43 @@ class LightRAG:
     async def _insert_done(
         self, pipeline_status=None, pipeline_status_lock=None
     ) -> None:
+        persist_start = time.perf_counter()
+        storage_targets = [
+            ("full_docs", self.full_docs),
+            ("doc_status", self.doc_status),
+            ("text_chunks", self.text_chunks),
+            ("full_entities", self.full_entities),
+            ("full_relations", self.full_relations),
+            ("entity_chunks", self.entity_chunks),
+            ("relation_chunks", self.relation_chunks),
+            ("llm_response_cache", self.llm_response_cache),
+            ("entities_vdb", self.entities_vdb),
+            ("relationships_vdb", self.relationships_vdb),
+            ("chunks_vdb", self.chunks_vdb),
+            ("chunk_entity_relation_graph", self.chunk_entity_relation_graph),
+        ]
+
+        async def _timed_persist(
+            storage_name: str, storage_inst: StorageNameSpace
+        ) -> None:
+            storage_start = time.perf_counter()
+            try:
+                await cast(StorageNameSpace, storage_inst).index_done_callback()
+            finally:
+                storage_duration = time.perf_counter() - storage_start
+                logger.info(
+                    f"Persist detail: {storage_name} {storage_duration:.2f}s"
+                )
+
         tasks = [
-            cast(StorageNameSpace, storage_inst).index_done_callback()
-            for storage_inst in [  # type: ignore
-                self.full_docs,
-                self.doc_status,
-                self.text_chunks,
-                self.full_entities,
-                self.full_relations,
-                self.entity_chunks,
-                self.relation_chunks,
-                self.llm_response_cache,
-                self.entities_vdb,
-                self.relationships_vdb,
-                self.chunks_vdb,
-                self.chunk_entity_relation_graph,
-            ]
+            asyncio.create_task(_timed_persist(name, storage_inst))
+            for name, storage_inst in storage_targets
             if storage_inst is not None
         ]
         await asyncio.gather(*tasks)
 
-        log_message = "In memory DB persist to disk"
+        persist_duration = time.perf_counter() - persist_start
+        log_message = f"In memory DB persist to disk in {persist_duration:.2f}s"
         logger.info(log_message)
 
         if pipeline_status is not None and pipeline_status_lock is not None:
