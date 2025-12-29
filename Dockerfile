@@ -90,6 +90,10 @@ RUN --mount=type=cache,target=/root/.local/share/uv \
     uv sync --frozen --no-dev --extra api --extra offline --no-editable \
     && /app/.venv/bin/python -m ensurepip --upgrade
 
+# Optional debugpy install for VS Code attach debugging
+ARG INSTALL_DEBUGPY=false
+RUN if [ "$INSTALL_DEBUGPY" = "true" ]; then /app/.venv/bin/python -m pip install --no-cache-dir debugpy; fi
+
 # Create persistent data directories AFTER package installation
 RUN mkdir -p /app/data/rag_storage /app/data/inputs /app/data/tiktoken
 

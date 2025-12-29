@@ -100,6 +100,11 @@ class QueryRequest(BaseModel):
         description="If True, includes reference list in responses. Affects /query and /query/stream endpoints. /query/data always includes references.",
     )
 
+    enable_llm_filter: Optional[bool] = Field(
+        default=None,
+        description="If True, applies an LLM-based relevance filter before building the final context.",
+    )
+
     include_chunk_content: Optional[bool] = Field(
         default=False,
         description="If True, includes actual chunk text content in references. Only applies when include_references=True. Useful for evaluation and debugging.",
@@ -134,7 +139,8 @@ class QueryRequest(BaseModel):
         # Use Pydantic's `.model_dump(exclude_none=True)` to remove None values automatically
         # Exclude API-level parameters that don't belong in QueryParam
         request_data = self.model_dump(
-            exclude_none=True, exclude={"query", "include_chunk_content"}
+            exclude_none=True,
+            exclude={"query", "include_chunk_content"},
         )
 
         # Ensure `mode` and `stream` are set explicitly
@@ -162,6 +168,10 @@ class QueryResponse(BaseModel):
         default=None,
         description="Reference list (Disabled when include_references=False, /query/data always includes references.)",
     )
+    filtering: Optional[bool] = Field(
+        default=None,
+        description="Indicates whether LLM relevance filtering was applied (only included when enabled).",
+    )
 
 
 class QueryDataResponse(BaseModel):
@@ -182,12 +192,26 @@ class StreamChunkResponse(BaseModel):
         default=None,
         description="Reference list (only in first chunk when include_references=True)",
     )
+    filtering: Optional[bool] = Field(
+        default=None,
+        description="Filtering flag (only present when LLM filtering is enabled)",
+    )
     response: Optional[str] = Field(
         default=None, description="Response content chunk or complete response"
     )
     error: Optional[str] = Field(
         default=None, description="Error message if processing fails"
     )
+
+
+def _extract_filtering_flag(result: Dict[str, Any]) -> bool | None:
+    metadata = result.get("metadata", {})
+    filtering = metadata.get("filtering", {})
+    if not isinstance(filtering, dict):
+        return None
+    if not filtering.get("enabled"):
+        return None
+    return filtering.get("status") in {"success", "empty"}
 
 
 def create_query_routes(rag, api_key: Optional[str] = None, top_k: int = 60):
@@ -415,6 +439,7 @@ def create_query_routes(rag, api_key: Optional[str] = None, top_k: int = 60):
             llm_response = result.get("llm_response", {})
             data = result.get("data", {})
             references = data.get("references", [])
+            filtering_flag = _extract_filtering_flag(result)
 
             # Get the non-streaming response content
             response_content = llm_response.get("content", "")
@@ -446,9 +471,18 @@ def create_query_routes(rag, api_key: Optional[str] = None, top_k: int = 60):
 
             # Return response with or without references based on request
             if request.include_references:
-                return QueryResponse(response=response_content, references=references)
+                response_payload = {
+                    "response": response_content,
+                    "references": references,
+                }
             else:
-                return QueryResponse(response=response_content, references=None)
+                response_payload = {
+                    "response": response_content,
+                    "references": None,
+                }
+            if filtering_flag is not None:
+                response_payload["filtering"] = filtering_flag
+            return QueryResponse(**response_payload)
         except Exception as e:
             logger.error(f"Error processing query: {str(e)}", exc_info=True)
             raise HTTPException(status_code=500, detail=str(e))
@@ -668,6 +702,7 @@ def create_query_routes(rag, api_key: Optional[str] = None, top_k: int = 60):
 
             # Unified approach: always use aquery_llm for all cases
             result = await rag.aquery_llm(request.query, param=param)
+            filtering_flag = _extract_filtering_flag(result)
 
             async def stream_generator():
                 # Extract references and LLM response from unified result
@@ -700,8 +735,13 @@ def create_query_routes(rag, api_key: Optional[str] = None, top_k: int = 60):
 
                 if llm_response.get("is_streaming"):
                     # Streaming mode: send references first, then stream response chunks
+                    first_payload = {}
                     if request.include_references:
-                        yield f"{json.dumps({'references': references})}\n"
+                        first_payload["references"] = references
+                    if filtering_flag is not None:
+                        first_payload["filtering"] = filtering_flag
+                    if first_payload:
+                        yield f"{json.dumps(first_payload)}\n"
 
                     response_stream = llm_response.get("response_iterator")
                     if response_stream:
@@ -722,6 +762,8 @@ def create_query_routes(rag, api_key: Optional[str] = None, top_k: int = 60):
                     complete_response = {"response": response_content}
                     if request.include_references:
                         complete_response["references"] = references
+                    if filtering_flag is not None:
+                        complete_response["filtering"] = filtering_flag
 
                     yield f"{json.dumps(complete_response)}\n"
 

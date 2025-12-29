@@ -1892,6 +1892,7 @@ async def use_llm_func_with_cache(
     cache_type: str = "extract",
     chunk_id: str | None = None,
     cache_keys_collector: list = None,
+    thinking_budget: int = 0,
 ) -> tuple[str, int]:
     """Call LLM function with cache support and text sanitization
 
@@ -1910,7 +1911,7 @@ async def use_llm_func_with_cache(
         chunk_id: Chunk identifier to store in cache
         text_chunks_storage: Text chunks storage to update llm_cache_list
         cache_keys_collector: Optional list to collect cache keys for batch processing
-
+        thinking_budget: Optional thinking budget in tokens
     Returns:
         tuple[str, int]: (LLM response text, timestamp)
             - For cache hits: (content, cache_create_time)
@@ -1974,9 +1975,16 @@ async def use_llm_func_with_cache(
             kwargs["history_messages"] = safe_history_messages
         if max_tokens is not None:
             kwargs["max_tokens"] = max_tokens
+        if thinking_budget is not None:
+            kwargs["generation_config"] = {
+                "thinking_config": {
+                    "thinking_budget": thinking_budget,
+                    "include_thoughts": True,
+                },
+            }
 
         res: str = await use_llm_func(
-            safe_user_prompt, system_prompt=safe_system_prompt, **kwargs
+            prompt=safe_user_prompt, system_prompt=safe_system_prompt, **kwargs
         )
 
         res = remove_think_tags(res)
@@ -2008,10 +2016,14 @@ async def use_llm_func_with_cache(
         kwargs["history_messages"] = safe_history_messages
     if max_tokens is not None:
         kwargs["max_tokens"] = max_tokens
-
+    if thinking_budget is not None:
+        kwargs["generation_config"] = {
+            "thinking_budget": thinking_budget,
+            "include_thoughts": True,
+        }
     try:
         res = await use_llm_func(
-            safe_user_prompt, system_prompt=safe_system_prompt, **kwargs
+            prompt=safe_user_prompt, system_prompt=safe_system_prompt, **kwargs
         )
     except Exception as e:
         # Add [LLM func] prefix to error message

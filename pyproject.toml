@@ -25,6 +25,7 @@ dependencies = [
     "configparser",
     "google-api-core>=2.0.0,<3.0.0",
     "google-genai>=1.0.0,<2.0.0",
+    "httpx>=0.28.1",
     "json_repair",
     "nano-vectordb",
     "networkx",

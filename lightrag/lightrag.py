@@ -34,6 +34,8 @@ from lightrag.constants import (
     DEFAULT_MAX_ENTITY_TOKENS,
     DEFAULT_MAX_RELATION_TOKENS,
     DEFAULT_MAX_TOTAL_TOKENS,
+    DEFAULT_LLM_FILTER_RELATION_BATCH_SIZE,
+    DEFAULT_LLM_FILTER_CHUNK_BATCH_SIZE,
     DEFAULT_COSINE_THRESHOLD,
     DEFAULT_RELATED_CHUNK_NUMBER,
     DEFAULT_KG_CHUNK_PICK_METHOD,
@@ -312,6 +314,33 @@ class LightRAG:
 
     llm_model_func: Callable[..., object] | None = field(default=None)
     """Function for interacting with the large language model (LLM). Must be set before use."""
+
+    llm_filter_model_func: Callable[..., object] | None = field(default=None)
+    """Optional LLM function for relevance filtering before final response generation."""
+
+    llm_relation_filter_model_func: Callable[..., object] | None = field(default=None)
+    """Optional LLM function for relation-only relevance filtering."""
+
+    llm_chunk_filter_model_func: Callable[..., object] | None = field(default=None)
+    """Optional LLM function for chunk-only relevance filtering."""
+
+    llm_filter_relation_batch_size: int = field(
+        default=get_env_value(
+            "LLM_FILTER_RELATION_BATCH_SIZE",
+            DEFAULT_LLM_FILTER_RELATION_BATCH_SIZE,
+            int,
+        )
+    )
+    """Batch size for relation LLM filtering."""
+
+    llm_filter_chunk_batch_size: int = field(
+        default=get_env_value(
+            "LLM_FILTER_CHUNK_BATCH_SIZE",
+            DEFAULT_LLM_FILTER_CHUNK_BATCH_SIZE,
+            int,
+        )
+    )
+    """Batch size for chunk LLM filtering."""
 
     llm_model_name: str = field(default="gpt-4o-mini")
     """Name of the LLM model used for generating responses."""
@@ -2738,6 +2767,7 @@ class LightRAG:
             model_func=param.model_func,
             user_prompt=param.user_prompt,
             enable_rerank=param.enable_rerank,
+            enable_llm_filter=param.enable_llm_filter,
         )
 
         query_result = None

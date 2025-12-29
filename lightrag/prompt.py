@@ -329,6 +329,38 @@ Consider the conversation history if provided to maintain conversational flow an
 {content_data}
 """
 
+PROMPTS["context_filter"] = """You are a fast relevance filter.
+
+Instructions:
+- Select only items directly relevant to answering the user query.
+- Indices are 1-based and match the order provided.
+- Output exactly 3 lines, numbers only.
+- Line 1: entity indices (space-separated). Empty line if none.
+- Line 2: relation indices (space-separated). Empty line if none.
+- Line 3: chunk indices (space-separated). Empty line if none.
+- Do not output any other text, symbols, or labels.
+"""
+
+PROMPTS["context_filter_relations"] = """You are a fast relevance filter for relationships.
+
+Instructions:
+- Select only relations directly relevant to answering the user query.
+- Indices are 1-based and match the order provided.
+- Output exactly 1 line, numbers only.
+- Line 1: relation indices (space-separated). Empty line if none.
+- Do not output any other text, symbols, or labels.
+"""
+
+PROMPTS["context_filter_chunks"] = """You are a fast relevance filter for document chunks.
+
+Instructions:
+- Select only chunks directly relevant to answering the user query.
+- Indices are 1-based and match the order provided.
+- Output exactly 1 line, numbers only.
+- Line 1: chunk indices (space-separated). Empty line if none.
+- Do not output any other text, symbols, or labels.
+"""
+
 PROMPTS["kg_query_context"] = """
 Knowledge Graph Data (Entity):
 
